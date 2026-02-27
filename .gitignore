@@ -1,0 +1,35 @@
+# CMake build directories
+build/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+cmake_install.cmake
+install/
+bin/
+lib/
+
+# Qt specific
+*.user
+*.pro.user
+*.qm
+*.moc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Temporary and backup files
+*~
+*.swp
+*.bak
+*.tmp
+*.temp
+
+# OS specific files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,32 @@
+#ifndef RTP_SENDER_H
+#define RTP_SENDER_H
+
+#include <string>
+#include <atomic>
+#include <functional> // 👈 新增：为了使用现代 C++ 的回调函数魔法
+#include "CameraCapture.h" // 👈 引入摄像头采集模块
+
+class RtpSender {
+private:
+    int udp_socket;         
+    std::string dest_ip;    
+    int dest_port;          
+    int local_port;         
+    
+    // 🛑 个人专属遥控器
+    std::atomic<bool>* running_flag;
+
+public:
+    // ✨ 新增：流量汇报口。只要有数据发出去，就通过它喊一声
+    std::function<void(int)> onTraffic;
+
+    RtpSender(std::string ip, int port, int local_port, std::atomic<bool>* flag);
+    ~RtpSender();
+    
+    void sendVideo(const std::string& filename);
+    
+    // ✨ 新增：零延迟摄像头实时推流
+    void sendLiveCamera();
+};
+
+#endif

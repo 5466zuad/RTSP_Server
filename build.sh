@@ -6,6 +6,11 @@ set -e
 echo "========================================"
 echo "🧹 [1/4] 正在清理旧战场并配置环境..."
 
+# ✨ 关键：先杀掉残留的旧进程，防止端口被占用
+echo "🔪 清理残留进程..."
+sudo kill -9 $(pgrep -f rtsp_server) 2>/dev/null || true
+sleep 1
+
 # ✨ 关键：在脚本里也声明一下显示器地址，防止 sudo 弄丢环境变量
 export DISPLAY=$(grep -m 1 nameserver /etc/resolv.conf | awk '{print $2}'):0.0
 

@@ -7,7 +7,11 @@
 #include <string>
 #include <atomic>
 #include <memory>
-#include "ThreadPool.h" // 你的线程池
+#include "ThreadPool.h"
+ // 你的线程池
+
+
+#include "RtpSender.h" // 引入 RtpSender 供 ClientContext 使用
 
 // 把客户档案提到这里，因为成员变量要用到它
 struct ClientContext {
@@ -18,6 +22,7 @@ struct ClientContext {
     std::string session_id; 
     std::shared_ptr<std::atomic<bool>> is_playing;
     std::string read_buffer;
+    std::shared_ptr<RtpSender> rtp_sender; // ✨ 新增：每个客户端专属的点对点发包员
 
     ClientContext() {
         is_playing = std::make_shared<std::atomic<bool>>(false);
@@ -41,6 +46,8 @@ public slots:
     void resumeAllStreams();
 
 private:
+    void liveStreamThread(); // ✨ 新增：全局唯一的后台采编大内总管
+    
     ThreadPool pool;
     
     // 🗃️ 核心：全服客户名单与安全锁

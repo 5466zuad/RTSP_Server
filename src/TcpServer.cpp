@@ -252,8 +252,8 @@ bool TcpServer::start(int port) {
                             };
 
                             // 判断你要播文件还是直播 
-                            sender.sendVideo("../download/test_raw.h264");  // 使用转换后的裸流 H264
-                            // sender.sendLiveCamera(); // 已隐藏，避免 WSL 找不到摄像头
+                            // sender.sendVideo("../download/test_raw.h264");  // 文件推流（已关闭）
+                            sender.sendLiveCamera(); // ✨ 启用摄像头实时推流
                             
                             std::cout << "✅ [Port:" << my_local_port << "] 推流线程结束" << std::endl;
                         });
@@ -338,7 +338,8 @@ void TcpServer::resumeAllStreams() {
                 sender.onTraffic = [this](int bytes) {
                     emit this->dataSent(bytes);
                 };
-                sender.sendVideo("../download/test_raw.h264"); // ✨ 恢复推流使用裸流 H264
+                // sender.sendVideo("../download/test_raw.h264"); // 文件推流（已关闭）
+                sender.sendLiveCamera(); // ✨ 恢复推流使用摄像头实时流
                 std::cout << "✅ [Port:" << my_local_port << "] 恢复推流线程结束" << std::endl;
             });
         }

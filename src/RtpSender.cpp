@@ -11,7 +11,10 @@
 #include <csignal> 
 #include <opencv2/opencv.hpp>
 #include <x264.h>
-#include "../include/CameraCapture.h" // 使用新的采集模块
+#include "../include/CameraCapture.h"
+#include <chrono>  // OSD 时间戳
+#include <ctime>   // OSD 格式化时间
+#include <iomanip> // OSD 格式化
 
 // 引用全局信号 (作为双重保险)
 extern std::atomic<bool> g_running;
@@ -207,41 +210,37 @@ cleanup:
     return;
 }
 
-void RtpSender::sendLiveCamera() {
-    if (udp_socket < 0) {
-        std::cout << "❌ [Port:" << local_port << "] Socket 未就绪，无法推流" << std::endl;
-        return;
-    }
-
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
     dest_addr.sin_addr.s_addr = inet_addr(dest_ip.c_str()); 
     dest_addr.sin_port = htons(dest_port); 
 
-    // 1️⃣ 打开摄像头
-    cv::VideoCapture cap(0);
+    // 1️⃣ 通过 UDP 接收 Windows 端 FFmpeg 推流（绕过防火墙！）
+    std::string stream_url = "udp://@:5000?overrun_nonfatal=1&fifo_size=50000000";
+    std::cout << "📷 [摄像头] 等待 Windows 端 UDP 推流 (port 5000)..." << std::endl;
+    cv::VideoCapture cap;
+    cap.open(stream_url, cv::CAP_FFMPEG); // 👈 强制 FFmpeg 后端
     if (!cap.isOpened()) {
-        std::cout << "❌ 找不到摄像头或摄像头被占用！" << std::endl;
+        std::cout << "❌ 无法接收 UDP 推流！请确保 Windows 端 FFmpeg 已在推流" << std::endl;
         return;
     }
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    cap.set(cv::CAP_PROP_FPS, 30);
+    int frame_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int frame_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    if (frame_w <= 0) frame_w = 640;
+    if (frame_h <= 0) frame_h = 480;
+    std::cout << "✅ 连接成功！分辨率: " << frame_w << "x" << frame_h << std::endl;
 
-    // 2️⃣ 初始化 x264 编码器
+    // 2️⃣ 初始化 x264 编码器（速度优先 + 画质平衡）
     x264_param_t param;
-    x264_param_default_preset(&param, "ultrafast", "zerolatency"); // 零延迟直播预设
-    param.i_threads = 1; 
-    param.i_width = 640;
-    param.i_height = 480;
+    x264_param_default_preset(&param, "ultrafast", "zerolatency"); // ✨ ultrafast 保证不卡
+    param.i_threads = 0; // 自动检测最优线程数
+    param.i_width = frame_w;
+    param.i_height = frame_h;
     param.i_fps_num = 30;
     param.i_fps_den = 1;
-    param.i_keyint_max = 30; // 关键帧间隔：1秒1个I帧
-    param.b_intra_refresh = 1; 
+    param.i_keyint_max = 60;
+    param.b_intra_refresh = 0;
     param.rc.i_rc_method = X264_RC_CRF;
-    param.rc.f_rf_constant = 25; // 画质配置
-    x264_param_apply_profile(&param, "baseline");
+    param.rc.f_rf_constant = 20; // ✨ CRF 20：画质好且不卡（25→ 20）
+    x264_param_apply_profile(&param, "main");
 
     x264_t* encoder = x264_encoder_open(&param);
     if (!encoder) {
@@ -261,9 +260,44 @@ void RtpSender::sendLiveCamera() {
     cv::Mat yuv_frame;
 
     // 3️⃣ 主循环抓包
+    int frame_count = 0;
+    auto fps_start = std::chrono::steady_clock::now();
+    double current_fps = 0.0;
+    double total_kbps = 0.0;
+
     while (g_running && running_flag && *running_flag) { 
         cap >> frame; // 📸 OpenCV 抓图！
         if (frame.empty()) continue;
+
+        // ✨ OSD 水印叠加
+        frame_count++;
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - fps_start).count();
+        if (elapsed >= 1.0) {
+            current_fps = frame_count / elapsed;
+            frame_count = 0;
+            fps_start = now;
+        }
+
+        // 获取当前时间
+        auto sys_now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(sys_now);
+        std::tm* tm_now = std::localtime(&time_t_now);
+        char time_buf[64];
+        std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_now);
+
+        // 绘制半透明黑色背景条
+        cv::rectangle(frame, cv::Point(0, 0), cv::Point(frame.cols, 56), cv::Scalar(0, 0, 0), cv::FILLED);
+
+        // 第一行：时间戳 + 分辨率
+        std::string line1 = std::string(time_buf) + "  |  " + std::to_string(frame_w) + "x" + std::to_string(frame_h);
+        cv::putText(frame, line1, cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+
+        // 第二行：FPS + 目标地址
+        char line2_buf[128];
+        snprintf(line2_buf, sizeof(line2_buf), "FPS: %.1f  |  RTSP -> %s:%d  |  Port: %d", 
+                 current_fps, dest_ip.c_str(), dest_port, local_port);
+        cv::putText(frame, line2_buf, cv::Point(10, 45), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
 
         // BGR 转 YUV (x264 需要 YUV420P)
         cv::cvtColor(frame, yuv_frame, cv::COLOR_BGR2YUV_I420);

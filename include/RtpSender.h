@@ -13,6 +13,11 @@ private:
     int dest_port;          
     int local_port;         
     
+    // 状态维护
+    uint16_t seq = 0;
+    uint32_t timestamp = 0;
+    int accumulated_bytes = 0;
+    
     // 🛑 个人专属遥控器
     std::atomic<bool>* running_flag;
 
@@ -25,8 +30,8 @@ public:
     
     void sendVideo(const std::string& filename);
     
-    // ✨ 新增：零延迟摄像头实时推流
-    void sendLiveCamera();
+    // ✨ 将 NALU 打包为 RTP 发送出去（不涉及任何采集和编码）
+    void sendNalu(uint8_t* nalu_data, int nalu_size, uint32_t ts_increment);
 };
 
 #endif

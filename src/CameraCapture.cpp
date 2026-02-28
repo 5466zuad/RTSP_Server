@@ -14,29 +14,32 @@ CameraCapture::~CameraCapture() {
 }
 
 void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluCallback onNalu) {
-    // 1️⃣ 打开摄像头
-    cv::VideoCapture cap(0);
+    // 1️⃣ 通过 UDP 接收 Windows 端 FFmpeg 推流（强制 FFmpeg 后端）
+    cv::VideoCapture cap;
+    cap.open("udp://@:5000?overrun_nonfatal=1&fifo_size=50000000", cv::CAP_FFMPEG);
     if (!cap.isOpened()) {
-        std::cout << "❌ 找不到摄像头或摄像头被占用！" << std::endl;
+        std::cout << "❌ 无法接收 UDP 推流！" << std::endl;
         return;
     }
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    int w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    if (w <= 0) w = 640;
+    if (h <= 0) h = 480;
     cap.set(cv::CAP_PROP_FPS, 30);
 
-    // 2️⃣ 初始化 x264 编码器
+    // 2️⃣ 初始化 x264 编码器（速度优先 + 画质平衡）
     x264_param_t param;
-    x264_param_default_preset(&param, "ultrafast", "zerolatency"); // 零延迟直播预设
-    param.i_threads = 1; 
-    param.i_width = 640;
-    param.i_height = 480;
+    x264_param_default_preset(&param, "ultrafast", "zerolatency");
+    param.i_threads = 0;
+    param.i_width = w;
+    param.i_height = h;
     param.i_fps_num = 30;
     param.i_fps_den = 1;
-    param.i_keyint_max = 30; // 关键帧间隔：1秒1个I帧
-    param.b_intra_refresh = 1; 
+    param.i_keyint_max = 60;
+    param.b_intra_refresh = 0;
     param.rc.i_rc_method = X264_RC_CRF;
-    param.rc.f_rf_constant = 25; // 画质配置
-    x264_param_apply_profile(&param, "baseline");
+    param.rc.f_rf_constant = 20;
+    x264_param_apply_profile(&param, "main");
 
     x264_t* encoder = x264_encoder_open(&param);
     if (!encoder) {

@@ -22,10 +22,12 @@ struct ClientContext {
     std::string session_id; 
     std::shared_ptr<std::atomic<bool>> is_playing;
     std::string read_buffer;
-    std::shared_ptr<RtpSender> rtp_sender; // ✨ 新增：每个客户端专属的点对点发包员
+    std::shared_ptr<RtpSender> rtp_sender; // ✨ 每个客户端专属的点对点发包员
+    bool need_headers = true;              // ✨ 新连接时需要先发 SPS/PPS 头
 
     ClientContext() {
         is_playing = std::make_shared<std::atomic<bool>>(false);
+        need_headers = true;
     }
 };
 

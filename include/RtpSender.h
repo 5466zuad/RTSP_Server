@@ -31,7 +31,7 @@ public:
     void sendVideo(const std::string& filename);
     
     // ✨ 将 NALU 打包为 RTP 发送出去（不涉及任何采集和编码）
-    void sendNalu(uint8_t* nalu_data, int nalu_size, uint32_t ts_increment);
+    void sendNalu(uint8_t* nalu_data, int nalu_size, uint32_t ts_increment, bool is_last_nalu = true);
 };
 
 #endif

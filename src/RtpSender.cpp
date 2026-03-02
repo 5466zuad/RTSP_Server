@@ -9,41 +9,26 @@
 #include <fstream>      
 #include <atomic> 
 #include <csignal> 
-#include <opencv2/opencv.hpp>
-#include <x264.h>
-#include "../include/CameraCapture.h"
-#include <chrono>  // OSD 时间戳
-#include <ctime>   // OSD 格式化时间
-#include <iomanip> // OSD 格式化
 
-// 引用全局信号 (作为双重保险)
-extern std::atomic<bool> g_running;
-
-// 🔥 构造函数：全副武装
 RtpSender::RtpSender(std::string ip, int port, int local_port, std::atomic<bool>* flag) 
-    : dest_ip(ip), dest_port(port), local_port(local_port), running_flag(flag) 
-{
-    udp_socket = socket(AF_INET, SOCK_DGRAM, 0); 
+    : dest_ip(ip), dest_port(port), local_port(local_port), running_flag(flag), seq(0), timestamp(0), accumulated_bytes(0) {
+    
+    udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_socket < 0) {
-        perror("❌ [RtpSender] socket 创建失败");
+        std::cerr << "❌ [Port:" << local_port << "] 创建 UDP Socket 失败" << std::endl;
         return;
     }
-    
-    // 1. 缓冲区扩容 (防花屏神器)
-    int send_buf_size = 4 * 1024 * 1024; // 4MB
-    setsockopt(udp_socket, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
 
-    // 2. 绑定指定的本地端口 (解决端口冲突)
     struct sockaddr_in local_addr;
-    memset(&local_addr, 0, sizeof(local_addr)); 
+    memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
-    local_addr.sin_addr.s_addr = INADDR_ANY;    
-    local_addr.sin_port = htons(local_port); 
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_addr.sin_port = htons(local_port);
 
     if (bind(udp_socket, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
-        perror("⚠️ [RtpSender] 警告：UDP 绑定失败！端口可能被占用");
+        std::cerr << "❌ [Port:" << local_port << "] 绑定本地端口失败！端口可能被占用" << std::endl;
         close(udp_socket);
-        udp_socket = -1; 
+        udp_socket = -1;
     } else {
         std::cout << "🔒 [Port:" << local_port << "] 绑定本地端口成功" << std::endl;
     }
@@ -51,7 +36,7 @@ RtpSender::RtpSender(std::string ip, int port, int local_port, std::atomic<bool>
 
 RtpSender::~RtpSender() {
     if (udp_socket >= 0) {
-        close(udp_socket); 
+        close(udp_socket);
         std::cout << "🔓 [Port:" << local_port << "] UDP Socket 已释放" << std::endl;
     }
 }
@@ -68,338 +53,199 @@ void RtpSender::sendVideo(const std::string& filename) {
     dest_addr.sin_addr.s_addr = inet_addr(dest_ip.c_str()); 
     dest_addr.sin_port = htons(dest_port); 
 
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cout << "❌ 找不到视频文件：" << filename << std::endl;
-        return;
-    }
-    std::streamsize size = file.tellg(); 
-    file.seekg(0, std::ios::beg);         
-
-    std::vector<uint8_t> buffer(size);
-    if (!file.read((char*)buffer.data(), size)) return;
-
-    std::cout << "🎬 [Port:" << local_port << "] 开始推流 → " << dest_ip << ":" << dest_port << std::endl;
-
-    uint16_t seq = 0;
-    uint32_t timestamp = 0;
-    int accumulated_bytes = 0; // 🌟 累计发送字节数，避免高频上报卡死 UI
-    
-    while (g_running && running_flag && *running_flag) { 
-        int pos = 0;
-        int start_code_len = 0;
-
-        while (pos < size - 3) {
-            if (buffer[pos] == 0 && buffer[pos+1] == 0 && buffer[pos+2] == 0 && buffer[pos+3] == 1) {
-                start_code_len = 4; break;
-            }
-            if (buffer[pos] == 0 && buffer[pos+1] == 0 && buffer[pos+2] == 1) {
-                start_code_len = 3; break;
-            }
-            pos++;
-        }
-
-        while (pos < size) {
-            if (!g_running || (running_flag && !(*running_flag))) {
-                std::cout << "⏸️  [Port:" << local_port << "] 收到停止信号，推流中断" << std::endl;
-                goto cleanup; 
-            }
-
-            int next_pos = pos + start_code_len;
-            int next_start_code_len = 0;
-            
-            while (next_pos < size) {
-                if (next_pos <= size - 4 && buffer[next_pos] == 0 && buffer[next_pos+1] == 0 && buffer[next_pos+2] == 0 && buffer[next_pos+3] == 1) {
-                    next_start_code_len = 4; break;
-                }
-                if (next_pos <= size - 3 && buffer[next_pos] == 0 && buffer[next_pos+1] == 0 && buffer[next_pos+2] == 1) {
-                    next_start_code_len = 3; break;
-                }
-                next_pos++;
-            }
-
-            int nalu_size = next_pos - pos - start_code_len;
-            if (nalu_size > 0) {
-                uint8_t* nalu_data = buffer.data() + pos + start_code_len;
-                uint8_t nalu_type = nalu_data[0] & 0x1F;
-
-                if (nalu_size <= 1400) {
-                    // 🟢 场景 1：单包发送
-                    uint8_t rtp_packet[1500];
-                    rtp_packet[0] = 0x80; rtp_packet[1] = 0xE0; 
-                    rtp_packet[2] = seq >> 8; rtp_packet[3] = seq & 0xFF;
-                    rtp_packet[4] = (timestamp >> 24) & 0xFF; rtp_packet[5] = (timestamp >> 16) & 0xFF;
-                    rtp_packet[6] = (timestamp >> 8) & 0xFF; rtp_packet[7] = timestamp & 0xFF;
-                    rtp_packet[8] = 0x88; rtp_packet[9] = 0x88; rtp_packet[10] = 0x88; rtp_packet[11] = 0x88;
-                    memcpy(rtp_packet + 12, nalu_data, nalu_size);
-                    
-                    // ✦ 核心逻辑：获取发出的字节，通过小探头送给老板娘！
-                    int bytes_sent = sendto(udp_socket, rtp_packet, nalu_size + 12, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-                    if (bytes_sent > 0 && onTraffic) {
-                        accumulated_bytes += bytes_sent;
-                        if (accumulated_bytes >= 65536) { // 🌟 攒够 64KB 上报一次
-                            onTraffic(accumulated_bytes);
-                            accumulated_bytes = 0;
-                        }
-                    }
-                    
-                    seq++;
-                } else {
-                    // 🟢 场景 2：FU-A 切片发送
-                    int payload_size = nalu_size - 1; 
-                    int nalu_payload_pos = 1;
-                    uint8_t fu_indicator = (nalu_data[0] & 0xE0) | 28; 
-                    bool is_first = true;
-
-                    while (payload_size > 0) {
-                        int chunk_size = (payload_size > 1400) ? 1400 : payload_size;
-                        bool is_last = (chunk_size == payload_size);
-                        uint8_t fu_header = nalu_type;
-                        if (is_first) fu_header |= 0x80; 
-                        if (is_last)  fu_header |= 0x40; 
-                        
-                        uint8_t rtp_packet[1500];
-                        rtp_packet[0] = 0x80; 
-                        rtp_packet[1] = (is_last ? 0xE0 : 0x60); 
-                        rtp_packet[2] = seq >> 8; rtp_packet[3] = seq & 0xFF;
-                        rtp_packet[4] = (timestamp >> 24) & 0xFF; rtp_packet[5] = (timestamp >> 16) & 0xFF;
-                        rtp_packet[6] = (timestamp >> 8) & 0xFF; rtp_packet[7] = timestamp & 0xFF;
-                        rtp_packet[8] = 0x88; rtp_packet[9] = 0x88; rtp_packet[10] = 0x88; rtp_packet[11] = 0x88;
-                        rtp_packet[12] = fu_indicator;
-                        rtp_packet[13] = fu_header;
-
-                        memcpy(rtp_packet + 14, nalu_data + nalu_payload_pos, chunk_size);
-                        
-                        // ✦ 核心逻辑：切片包同样要抓取字节数上报！
-                        int bytes_sent = sendto(udp_socket, rtp_packet, chunk_size + 14, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-                        if (bytes_sent > 0 && onTraffic) {
-                            accumulated_bytes += bytes_sent;
-                            if (accumulated_bytes >= 65536) { // 🌟 攒够 64KB 上报一次
-                                onTraffic(accumulated_bytes);
-                                accumulated_bytes = 0;
-                            }
-                        }
-                        
-                        usleep(10); 
-
-                        seq++;
-                        payload_size -= chunk_size;
-                        nalu_payload_pos += chunk_size;
-                        is_first = false;
-                    }
-                }
-
-                if (nalu_type >= 1 && nalu_type <= 5) {
-                    timestamp += 3600; 
-                    usleep(40000); 
-                } else {
-                    usleep(1000); 
-                }
-            }
-            pos = next_pos;
-            start_code_len = next_start_code_len;
-            if (start_code_len == 0) break; 
-        }
-    }
-
-cleanup:
-    if (accumulated_bytes > 0 && onTraffic) {
-        onTraffic(accumulated_bytes); // 🌟 发出剩余残余字节
-    }
-    std::cout << "🏁 [End] 推流任务结束" << std::endl;
-    return;
-}
-
-    dest_addr.sin_addr.s_addr = inet_addr(dest_ip.c_str()); 
-    dest_addr.sin_port = htons(dest_port); 
-
-    // 1️⃣ 通过 UDP 接收 Windows 端 FFmpeg 推流（绕过防火墙！）
-    std::string stream_url = "udp://@:5000?overrun_nonfatal=1&fifo_size=50000000";
-    std::cout << "📷 [摄像头] 等待 Windows 端 UDP 推流 (port 5000)..." << std::endl;
-    cv::VideoCapture cap;
-    cap.open(stream_url, cv::CAP_FFMPEG); // 👈 强制 FFmpeg 后端
-    if (!cap.isOpened()) {
-        std::cout << "❌ 无法接收 UDP 推流！请确保 Windows 端 FFmpeg 已在推流" << std::endl;
-        return;
-    }
-    int frame_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-    int frame_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-    if (frame_w <= 0) frame_w = 640;
-    if (frame_h <= 0) frame_h = 480;
-    std::cout << "✅ 连接成功！分辨率: " << frame_w << "x" << frame_h << std::endl;
-
-    // 2️⃣ 初始化 x264 编码器（速度优先 + 画质平衡）
-    x264_param_t param;
-    x264_param_default_preset(&param, "ultrafast", "zerolatency"); // ✨ ultrafast 保证不卡
-    param.i_threads = 0; // 自动检测最优线程数
-    param.i_width = frame_w;
-    param.i_height = frame_h;
-    param.i_fps_num = 30;
-    param.i_fps_den = 1;
-    param.i_keyint_max = 60;
-    param.b_intra_refresh = 0;
-    param.rc.i_rc_method = X264_RC_CRF;
-    param.rc.f_rf_constant = 20; // ✨ CRF 20：画质好且不卡（25→ 20）
-    x264_param_apply_profile(&param, "main");
-
-    x264_t* encoder = x264_encoder_open(&param);
-    if (!encoder) {
-        std::cout << "❌ x264 编码器初始化失败！" << std::endl;
+        std::cerr << "❌ 无法打开视频文件: " << filename << std::endl;
         return;
     }
 
-    x264_picture_t pic_in, pic_out;
-    x264_picture_alloc(&pic_in, X264_CSP_I420, param.i_width, param.i_height);
+    std::cout << "🎬 [Port:" << local_port << "] 本地文件推流开始 → " << dest_ip << ":" << dest_port << std::endl;
 
-    std::cout << "🎬 [Port:" << local_port << "] 摄像头实时推流开始 → " << dest_ip << ":" << dest_port << std::endl;
+    uint8_t rtp_packet[1500];
+    int rtp_header_size = 12;
 
-    uint16_t seq = 0;
-    uint32_t timestamp = 0;
+    rtp_packet[0] = 0x80;
+    rtp_packet[1] = 96; 
+
+    rtp_packet[8] = 0x12; rtp_packet[9] = 0x34; rtp_packet[10] = 0x56; rtp_packet[11] = 0x78;
+
+    std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    size_t pos = 0;
+
     int accumulated_bytes = 0; 
-    cv::Mat frame;
-    cv::Mat yuv_frame;
 
-    // 3️⃣ 主循环抓包
-    int frame_count = 0;
-    auto fps_start = std::chrono::steady_clock::now();
-    double current_fps = 0.0;
-    double total_kbps = 0.0;
-
-    while (g_running && running_flag && *running_flag) { 
-        cap >> frame; // 📸 OpenCV 抓图！
-        if (frame.empty()) continue;
-
-        // ✨ OSD 水印叠加
-        frame_count++;
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - fps_start).count();
-        if (elapsed >= 1.0) {
-            current_fps = frame_count / elapsed;
-            frame_count = 0;
-            fps_start = now;
+    while (pos < buffer.size() && running_flag && *running_flag) {
+        size_t start_code_pos = pos;
+        while (start_code_pos < buffer.size() - 4) {
+            if (buffer[start_code_pos] == 0 && buffer[start_code_pos+1] == 0 && 
+                buffer[start_code_pos+2] == 0 && buffer[start_code_pos+3] == 1) {
+                break;
+            }
+            start_code_pos++;
         }
 
-        // 获取当前时间
-        auto sys_now = std::chrono::system_clock::now();
-        auto time_t_now = std::chrono::system_clock::to_time_t(sys_now);
-        std::tm* tm_now = std::localtime(&time_t_now);
-        char time_buf[64];
-        std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_now);
+        if (start_code_pos >= buffer.size() - 4) break;
 
-        // 绘制半透明黑色背景条
-        cv::rectangle(frame, cv::Point(0, 0), cv::Point(frame.cols, 56), cv::Scalar(0, 0, 0), cv::FILLED);
-
-        // 第一行：时间戳 + 分辨率
-        std::string line1 = std::string(time_buf) + "  |  " + std::to_string(frame_w) + "x" + std::to_string(frame_h);
-        cv::putText(frame, line1, cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
-
-        // 第二行：FPS + 目标地址
-        char line2_buf[128];
-        snprintf(line2_buf, sizeof(line2_buf), "FPS: %.1f  |  RTSP -> %s:%d  |  Port: %d", 
-                 current_fps, dest_ip.c_str(), dest_port, local_port);
-        cv::putText(frame, line2_buf, cv::Point(10, 45), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
-
-        // BGR 转 YUV (x264 需要 YUV420P)
-        cv::cvtColor(frame, yuv_frame, cv::COLOR_BGR2YUV_I420);
-        
-        // 填充 x264 picture
-        int y_size = param.i_width * param.i_height;
-        memcpy(pic_in.img.plane[0], yuv_frame.data, y_size);
-        memcpy(pic_in.img.plane[1], yuv_frame.data + y_size, y_size / 4);
-        memcpy(pic_in.img.plane[2], yuv_frame.data + y_size + y_size / 4, y_size / 4);
-        pic_in.i_pts = timestamp;
-
-        x264_nal_t* nals;
-        int num_nals = 0;
-        int frame_size = x264_encoder_encode(encoder, &nals, &num_nals, &pic_in, &pic_out);
-
-        if (frame_size <= 0) continue;
-
-        // 4️⃣ RTP 发包流程 (和文件发送一致)
-        for (int i = 0; i < num_nals; ++i) {
-            uint8_t* nalu_data = nals[i].p_payload;
-            int nalu_size = nals[i].i_payload;
-
-            // 跳过 start code
-            int start_code_len = 4;
-            if (nalu_data[0] == 0 && nalu_data[1] == 0 && nalu_data[2] == 1) {
-                start_code_len = 3;
+        size_t next_start_code_pos = start_code_pos + 4;
+        while (next_start_code_pos < buffer.size() - 4) {
+            if (buffer[next_start_code_pos] == 0 && buffer[next_start_code_pos+1] == 0 && 
+                buffer[next_start_code_pos+2] == 0 && buffer[next_start_code_pos+3] == 1) {
+                break;
             }
-            nalu_data += start_code_len;
-            nalu_size -= start_code_len;
+            next_start_code_pos++;
+        }
 
-            uint8_t nalu_type = nalu_data[0] & 0x1F;
+        size_t nalu_size = next_start_code_pos - (start_code_pos + 4);
+        uint8_t* nalu_data = &buffer[start_code_pos + 4];
 
-            if (nalu_size <= 1400) {
-                // 单包发送
-                uint8_t rtp_packet[1500];
-                rtp_packet[0] = 0x80; rtp_packet[1] = 0xE0; // Marker 固定为 1 (虽然不精确，但 VLC 兼容)
+        uint8_t nalu_type = nalu_data[0] & 0x1F;
+
+        if (nalu_size <= 1400) {
+            rtp_packet[1] |= 0x80;
+            rtp_packet[2] = seq >> 8; rtp_packet[3] = seq & 0xFF;
+            rtp_packet[4] = (timestamp >> 24) & 0xFF; rtp_packet[5] = (timestamp >> 16) & 0xFF;
+            rtp_packet[6] = (timestamp >> 8) & 0xFF; rtp_packet[7] = timestamp & 0xFF;
+
+            memcpy(rtp_packet + 12, nalu_data, nalu_size);
+            
+            int bytes_sent = sendto(udp_socket, rtp_packet, nalu_size + 12, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+            if (bytes_sent > 0 && onTraffic) {
+                accumulated_bytes += bytes_sent;
+                if (accumulated_bytes >= 65536) { 
+                    onTraffic(accumulated_bytes);
+                    accumulated_bytes = 0;
+                }
+            }
+            seq++;
+        } else {
+            int payload_size = nalu_size - 1; 
+            int nalu_payload_pos = 1;
+            uint8_t fu_indicator = (nalu_data[0] & 0xE0) | 28; 
+            bool is_first = true;
+
+            while (payload_size > 0) {
+                int chunk_size = (payload_size > 1400) ? 1400 : payload_size;
+                bool is_last = (chunk_size == payload_size);
+                uint8_t fu_header = nalu_type;
+                if (is_first) fu_header |= 0x80; 
+                if (is_last)  fu_header |= 0x40; 
+                
+                rtp_packet[1] = (is_last ? 0xE0 : 0x60); 
                 rtp_packet[2] = seq >> 8; rtp_packet[3] = seq & 0xFF;
                 rtp_packet[4] = (timestamp >> 24) & 0xFF; rtp_packet[5] = (timestamp >> 16) & 0xFF;
                 rtp_packet[6] = (timestamp >> 8) & 0xFF; rtp_packet[7] = timestamp & 0xFF;
-                rtp_packet[8] = 0x88; rtp_packet[9] = 0x88; rtp_packet[10] = 0x88; rtp_packet[11] = 0x88;
-                memcpy(rtp_packet + 12, nalu_data, nalu_size);
+                rtp_packet[12] = fu_indicator;
+                rtp_packet[13] = fu_header;
+
+                memcpy(rtp_packet + 14, nalu_data + nalu_payload_pos, chunk_size);
                 
-                int bytes_sent = sendto(udp_socket, rtp_packet, nalu_size + 12, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+                int bytes_sent = sendto(udp_socket, rtp_packet, chunk_size + 14, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
                 if (bytes_sent > 0 && onTraffic) {
                     accumulated_bytes += bytes_sent;
                     if (accumulated_bytes >= 65536) { 
-                        onTraffic(accumulated_bytes); accumulated_bytes = 0;
+                        onTraffic(accumulated_bytes);
+                        accumulated_bytes = 0;
                     }
                 }
+                
+                usleep(500);
                 seq++;
-            } else {
-                // FU-A 切片发送
-                int payload_size = nalu_size - 1; 
-                int nalu_payload_pos = 1;
-                uint8_t fu_indicator = (nalu_data[0] & 0xE0) | 28; 
-                bool is_first = true;
-
-                while (payload_size > 0) {
-                    int chunk_size = (payload_size > 1400) ? 1400 : payload_size;
-                    bool is_last = (chunk_size == payload_size);
-                    uint8_t fu_header = nalu_type;
-                    if (is_first) fu_header |= 0x80; 
-                    if (is_last)  fu_header |= 0x40; 
-                    
-                    uint8_t rtp_packet[1500];
-                    rtp_packet[0] = 0x80; 
-                    rtp_packet[1] = (is_last ? 0xE0 : 0x60); 
-                    rtp_packet[2] = seq >> 8; rtp_packet[3] = seq & 0xFF;
-                    rtp_packet[4] = (timestamp >> 24) & 0xFF; rtp_packet[5] = (timestamp >> 16) & 0xFF;
-                    rtp_packet[6] = (timestamp >> 8) & 0xFF; rtp_packet[7] = timestamp & 0xFF;
-                    rtp_packet[8] = 0x88; rtp_packet[9] = 0x88; rtp_packet[10] = 0x88; rtp_packet[11] = 0x88;
-                    rtp_packet[12] = fu_indicator;
-                    rtp_packet[13] = fu_header;
-
-                    memcpy(rtp_packet + 14, nalu_data + nalu_payload_pos, chunk_size);
-                    
-                    int bytes_sent = sendto(udp_socket, rtp_packet, chunk_size + 14, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-                    if (bytes_sent > 0 && onTraffic) {
-                        accumulated_bytes += bytes_sent;
-                        if (accumulated_bytes >= 65536) { 
-                            onTraffic(accumulated_bytes); accumulated_bytes = 0;
-                        }
-                    }
-                    
-                    // 直播时不 usleep 切片间隔，尽量发送
-                    seq++;
-                    payload_size -= chunk_size;
-                    nalu_payload_pos += chunk_size;
-                    is_first = false;
-                }
+                payload_size -= chunk_size;
+                nalu_payload_pos += chunk_size;
+                is_first = false;
             }
         }
+
+        timestamp += 3000;
+        pos = next_start_code_pos;
+        usleep(33000); 
+    }
+}
+
+void RtpSender::sendNalu(uint8_t* nalu_data, int nalu_size, uint32_t ts_increment, bool is_last_nalu) {
+    if (!running_flag || !(*running_flag)) return;
+
+    this->timestamp += ts_increment;
+
+    uint8_t rtp_packet[1500];
+    int rtp_header_size = 12;
+    
+    rtp_packet[0] = 0x80; // V=2, P=0, X=0, CC=0
+    rtp_packet[1] = 96;   // M=0 initially, PT=96
+    
+    rtp_packet[2] = (this->seq >> 8) & 0xFF;
+    rtp_packet[3] = this->seq & 0xFF;
+    
+    rtp_packet[4] = (this->timestamp >> 24) & 0xFF;
+    rtp_packet[5] = (this->timestamp >> 16) & 0xFF;
+    rtp_packet[6] = (this->timestamp >> 8) & 0xFF;
+    rtp_packet[7] = this->timestamp & 0xFF;
+    
+    rtp_packet[8] = 0x12;
+    rtp_packet[9] = 0x34;
+    rtp_packet[10] = 0x56;
+    rtp_packet[11] = 0x78;
+
+    uint8_t nal_header = nalu_data[0];
+    
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_addr.s_addr = inet_addr(dest_ip.c_str()); 
+    dest_addr.sin_port = htons(dest_port); 
+
+    if (nalu_size <= 1400) {
+        if (is_last_nalu) rtp_packet[1] |= 0x80; // Mark bit = 1
+        memcpy(rtp_packet + 12, nalu_data, nalu_size);
+        int sent = sendto(udp_socket, rtp_packet, 12 + nalu_size, 0, 
+                          (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+        if (sent > 0) this->accumulated_bytes += sent;
+        this->seq++;
+    } else {
+        uint8_t fu_indicator = (nal_header & 0xE0) | 28;
+        uint8_t fu_header = nal_header & 0x1F;
         
-        // OpenCV 的 cap>>frame 天然会按照 30 fps 进行等待 (33ms 左右)
-        // 此处的 timestamp 是按照 90000 Hz 的时钟，每帧占 3000
-        timestamp += 3000; 
+        int offset = 1; 
+        int remaining = nalu_size - 1;
+        bool is_first = true;
+        
+        while (remaining > 0) {
+            int chunk_size = (remaining > 1400) ? 1400 : remaining;
+            bool is_last_chunk = (remaining == chunk_size);
+            
+            rtp_packet[1] = 96;
+            if (is_last_chunk && is_last_nalu) rtp_packet[1] |= 0x80; 
+            
+            rtp_packet[2] = (this->seq >> 8) & 0xFF;
+            rtp_packet[3] = this->seq & 0xFF;
+            
+            rtp_packet[12] = fu_indicator;
+            rtp_packet[13] = fu_header;
+            
+            if (is_first) {
+                rtp_packet[13] |= 0x80; 
+                is_first = false;
+            } else if (is_last_chunk) {
+                rtp_packet[13] |= 0x40; 
+            } else {
+                rtp_packet[13] &= ~0xC0; 
+            }
+            
+            memcpy(rtp_packet + 14, nalu_data + offset, chunk_size);
+            int sent = sendto(udp_socket, rtp_packet, 14 + chunk_size, 0, 
+                              (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+            if (sent > 0) this->accumulated_bytes += sent;
+            
+            this->seq++;
+            offset += chunk_size;
+            remaining -= chunk_size;
+        }
     }
 
-    if (accumulated_bytes > 0 && onTraffic) {
-        onTraffic(accumulated_bytes); 
+    if (this->accumulated_bytes > 100 * 1024) {
+        if (onTraffic) {
+            onTraffic(this->accumulated_bytes);
+        }
+        this->accumulated_bytes = 0;
     }
-    x264_picture_clean(&pic_in);
-    x264_encoder_close(encoder);
-    std::cout << "🏁 [End] 摄像头实时推流任务结束" << std::endl;
 }

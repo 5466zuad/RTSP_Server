@@ -3,31 +3,34 @@ project(RTSPServer)
 
 # 1. 基础设置
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # 让 VSCode 别画红线
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 2. 开启 Qt 自动化 (MOC/UIC/RCC)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTOUIC ON)
-set(CMAKE_AUTORCC ON)
-
-# 3. 寻找外援库 (多线程 + Qt5)
+# 2. 寻找依赖库
 find_package(Threads REQUIRED)
-find_package(Qt5 REQUIRED COMPONENTS Widgets Charts)
+find_package(PkgConfig REQUIRED)
 
-# 4. 🔥 核心修改在这里：把新文件加进编译名单！
-# 注意路径要写对：src/xxx.cpp 和 include/xxx.h
-add_executable(rtsp_server 
-    src/main.cpp 
-    src/TcpServer.cpp 
+# 用 pkg-config 寻找 FFmpeg 和 x264
+pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavdevice libswscale libavutil)
+pkg_check_modules(X264 REQUIRED x264)
+
+# 3. 源文件（纯无界面模式，去掉 Qt/MainWindow）
+add_executable(rtsp_server
+    src/main.cpp
+    src/TcpServer.cpp
     src/RtpSender.cpp
-    src/MainWindow.cpp   # 新来的 UI 实现
-    include/MainWindow.h # 新来的 UI 头文件
-    include/TcpServer.h  # 👈 💥 核心修复点：把带信号的服务器头文件加进来！
+    src/CameraCapture.cpp
 )
 
-# 5. 链接库 (给程序装上 Qt、线程 的翅膀)
-target_link_libraries(rtsp_server PRIVATE 
+# 4. 引入头文件目录
+target_include_directories(rtsp_server PRIVATE
+    include
+    ${FFMPEG_INCLUDE_DIRS}
+    ${X264_INCLUDE_DIRS}
+)
+
+# 5. 链接库
+target_link_libraries(rtsp_server PRIVATE
     Threads::Threads
-    Qt5::Widgets
-    Qt5::Charts
+    ${FFMPEG_LIBRARIES}
+    ${X264_LIBRARIES}
 )

@@ -1,20 +1,16 @@
-#ifndef CAMERA_CAPTURE_H
-#define CAMERA_CAPTURE_H
-
-#include <atomic>
+#pragma once
 #include <functional>
-#include <stdint.h>
+#include <cstdint>
+#include <atomic>
+
+// NALU 回调类型：(数据指针, 数据长度, 时间戳)
+using NaluCallback = std::function<void(uint8_t*, int, uint32_t)>;
 
 class CameraCapture {
 public:
-    // 回调函数：返回 NALU 数据指针、大小、以及时间戳
-    using NaluCallback = std::function<void(uint8_t* nalu_data, int nalu_size, uint32_t timestamp)>;
-
     CameraCapture();
     ~CameraCapture();
 
-    // 开始采集与编码，直到 running_flag 为 false
+    // 启动采集+编码，内部自己跑死循环，通过 onNalu 往外推数据
     void startCaptureAndEncode(std::atomic<bool>* running_flag, NaluCallback onNalu);
 };
-
-#endif

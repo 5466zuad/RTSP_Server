@@ -1,29 +1,24 @@
 #ifndef TCP_SERVER_H
 #define TCP_SERVER_H
 
-#include <QObject>      // 👈 必须继承它才能用信号槽！
 #include <map>
 #include <mutex>
 #include <string>
 #include <atomic>
 #include <memory>
+#include <functional>
 #include "ThreadPool.h"
- // 你的线程池
+#include "RtpSender.h"
 
-
-#include "RtpSender.h" // 引入 RtpSender 供 ClientContext 使用
-
-// 把客户档案提到这里，因为成员变量要用到它
 struct ClientContext {
     std::string ip;
     int client_port = 0;
     int server_rtp_port = 0;
     int cseq = 0;
-    std::string session_id; 
+    std::string session_id;
     std::shared_ptr<std::atomic<bool>> is_playing;
-    std::string read_buffer;
-    std::shared_ptr<RtpSender> rtp_sender; // ✨ 每个客户端专属的点对点发包员
-    bool need_headers = true;              // ✨ 新连接时需要先发 SPS/PPS 头
+    std::shared_ptr<RtpSender> rtp_sender;
+    bool need_headers = true; // 新连接需要等到 IDR 帧才开始推
 
     ClientContext() {
         is_playing = std::make_shared<std::atomic<bool>>(false);
@@ -31,30 +26,21 @@ struct ClientContext {
     }
 };
 
-class TcpServer : public QObject {
-    Q_OBJECT // 👈 灵魂宏！加了它才能用 emit
-
+class TcpServer {
 public:
-    TcpServer(QObject *parent = nullptr) : QObject(parent), pool(10) {} // 初始化10个小弟
+    TcpServer() : pool(8) {}  // 线程池 8 个工作线程
     bool start(int port);
 
-signals:
-    // 📢 告诉老板娘：我又发了多少数据！
-    void dataSent(int bytes);
+    // 分发一帧 NALU 给所有正在播放的客户端（由采集线程回调触发）
+    void dispatchNalu(uint8_t* data, int size, uint32_t timestamp);
 
-public slots:
-    // 📢 接收老板娘的指令：全服停工/开工！
     void stopAllStreams();
     void resumeAllStreams();
 
 private:
-    void liveStreamThread(); // ✨ 新增：全局唯一的后台采编大内总管
-    
     ThreadPool pool;
-    
-    // 🗃️ 核心：全服客户名单与安全锁
-    std::map<int, std::shared_ptr<ClientContext>> m_clients; 
-    std::mutex m_clientsMutex; 
+    std::map<int, std::shared_ptr<ClientContext>> m_clients;
+    std::mutex m_clientsMutex;
 };
 
 #endif

@@ -5,6 +5,8 @@
 #include "../include/CameraCapture.h"
 #include <iostream>
 #include <cstring>
+#include <thread>
+#include <chrono>
 
 extern "C" {
 #include <libavdevice/avdevice.h>
@@ -26,27 +28,14 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     // ─────────────────────────────────────────────────────────
     avdevice_register_all();
 
-    // 找到 video4linux2 "输入格式"
-    AVInputFormat* input_fmt = av_find_input_format("video4linux2");
-    if (!input_fmt) {
-        std::cerr << "❌ 找不到 v4l2 驱动，请确认内核支持 v4l2" << std::endl;
-        return;
-    }
-
-    // 设置采集参数字典：分辨率 + 帧率
-    AVDictionary* options = nullptr;
-    av_dict_set(&options, "video_size", "1280x720", 0);
-    av_dict_set(&options, "framerate",  "30",       0);
-    av_dict_set(&options, "input_format", "yuyv422", 0); // 大多数 USB 摄像头支持
-
-    // 打开摄像头（独占 /dev/video0）
+    // 打开本地视频文件
     AVFormatContext* fmt_ctx = avformat_alloc_context();
-    int ret = avformat_open_input(&fmt_ctx, "/dev/video0", input_fmt, &options);
-    av_dict_free(&options);
+    int ret = avformat_open_input(&fmt_ctx, "download/test.mp4", nullptr, nullptr);
     if (ret < 0) {
         char err[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, err, sizeof(err));
-        std::cerr << "❌ 打开摄像头失败: " << err << std::endl;
+        std::cerr << "❌ 打开视频文件 download/test.mp4 失败: " << err << std::endl;
+        std::cerr << "请确保项目根目录下有 download/test.mp4 文件！" << std::endl;
         return;
     }
 
@@ -108,10 +97,7 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
         return;
     }
 
-    // 申请 YUV 输出帧的内存（plane[0]=Y, plane[1]=U, plane[2]=V）
-    uint8_t* yuv_data[4] = {nullptr};
-    int      yuv_linesize[4];
-    av_image_alloc(yuv_data, yuv_linesize, width, height, AV_PIX_FMT_YUV420P, 32);
+    //（内存已由 x264_picture_alloc 自动分配并在最终自动释放，无需手动额外开辟 YUV_data 副本）
 
     // ─────────────────────────────────────────────────────────
     // 4️⃣  x264 编码器初始化
@@ -132,7 +118,6 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     x264_t* encoder = x264_encoder_open(&param);
     if (!encoder) {
         std::cerr << "❌ x264 编码器初始化失败" << std::endl;
-        av_freep(&yuv_data[0]);
         sws_freeContext(sws_ctx);
         avformat_close_input(&fmt_ctx);
         return;
@@ -153,11 +138,21 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
 
     std::cout << "🎬 开始采集循环..." << std::endl;
 
+    auto next_frame_time = std::chrono::steady_clock::now();
+    const auto frame_duration = std::chrono::milliseconds(33); // ~30 fps
+
     while (running_flag && *running_flag) {
 
-        // 从摄像头读取一个数据包
-        if (av_read_frame(fmt_ctx, pkt) < 0) {
-            std::cerr << "⚠️  av_read_frame 失败，尝试重新读取..." << std::endl;
+        // 从文件读取一个数据包
+        int ret = av_read_frame(fmt_ctx, pkt);
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                std::cout << "🔄 视频播放结束，自动重新循环播放..." << std::endl;
+                avio_seek(fmt_ctx->pb, 0, SEEK_SET);
+                avformat_seek_file(fmt_ctx, -1, INT64_MIN, 0, INT64_MAX, 0);
+            } else {
+                std::cerr << "⚠️  av_read_frame 读取失败" << std::endl;
+            }
             av_packet_unref(pkt);
             continue;
         }
@@ -167,39 +162,46 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
             continue;
         }
 
-        // ── 格式清洗：把原始/压缩帧统一转换成 YUV420P ──
+        // 等待直到下一帧的时间点，保持相对恒定的平滑帧率
+        next_frame_time += frame_duration;
+        std::this_thread::sleep_until(next_frame_time);
+
+        // ── 格式清洗：直接转换并在 x264 的 pic_in 分配的内存中输出 ──
         uint8_t* src_data[4]     = {nullptr};
         int      src_linesize[4] = {0};
+        
+        bool frame_ready = false;
 
         if (need_decode) {
             // MJPEG / 其他压缩格式需要先解码
             if (avcodec_send_packet(dec_ctx, pkt) >= 0) {
-                if (avcodec_receive_frame(dec_ctx, raw_frame) >= 0) {
-                    // 用解码出来的帧做 sws_scale
+                while (avcodec_receive_frame(dec_ctx, raw_frame) >= 0) {
+                    // 用解码出来的帧做 sws_scale，直接输出到 pic_in
                     sws_scale(sws_ctx,
                               raw_frame->data, raw_frame->linesize,
                               0, height,
-                              yuv_data, yuv_linesize);
+                              pic_in.img.plane, pic_in.img.i_stride);
                     av_frame_unref(raw_frame);
+                    frame_ready = true;
                 }
             }
         } else {
-            // 原始格式（YUYV 等）：直接填 src_data 做 sws_scale
+            // 原始格式（YUYV 等）：直接填 src_data 做 sws_scale，输出到 pic_in
             av_image_fill_arrays(src_data, src_linesize,
                                  pkt->data, src_pix_fmt, width, height, 1);
             sws_scale(sws_ctx,
                       src_data, src_linesize,
                       0, height,
-                      yuv_data, yuv_linesize);
+                      pic_in.img.plane, pic_in.img.i_stride);
+            frame_ready = true;
         }
 
         av_packet_unref(pkt);
 
-        // ── 填充 x264 输入结构体 ──
-        int y_size = width * height;
-        memcpy(pic_in.img.plane[0], yuv_data[0], y_size);
-        memcpy(pic_in.img.plane[1], yuv_data[1], y_size / 4);
-        memcpy(pic_in.img.plane[2], yuv_data[2], y_size / 4);
+        if (!frame_ready) {
+            continue;
+        }
+
         pic_in.i_pts = pts_counter;
 
         // ── 编码 ──
@@ -224,7 +226,6 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     x264_encoder_close(encoder);
     av_frame_free(&raw_frame);
     av_packet_free(&pkt);
-    av_freep(&yuv_data[0]);
     sws_freeContext(sws_ctx);
     if (need_decode) avcodec_free_context(&dec_ctx);
     avformat_close_input(&fmt_ctx);

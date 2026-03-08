@@ -19,6 +19,9 @@ add_executable(rtsp_server
     src/TcpServer.cpp
     src/RtpSender.cpp
     src/CameraCapture.cpp
+    src/video/VideoSource.cpp
+    src/video/FrameScaler.cpp
+    src/video/H264Encoder.cpp
 )
 
 # 4. 引入头文件目录

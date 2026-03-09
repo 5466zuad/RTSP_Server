@@ -127,7 +127,7 @@ void RtpSender::sendNalu(uint8_t* nalu_data, int nalu_size, uint32_t ts, bool is
         }
     }
 
-    if (this->accumulated_bytes > 100 * 1024) {
+    if (this->accumulated_bytes > 10 * 1024) {
         if (onTraffic) {
             onTraffic(this->accumulated_bytes);
         }

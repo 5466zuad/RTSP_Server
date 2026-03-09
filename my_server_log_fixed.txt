@@ -1,0 +1,19 @@
+[INFO] RTSP server start: port=8554 input=camera
+[INFO] 运行中，VLC 打开: rtsp://<ip>:8554/
+[INFO] 摄像头模式: device=/dev/video0 1280x720@30
+[INFO] Epoll RTSP server starting...
+[INFO] Host IP: 192.168.177.129
+[INFO] Waiting RTSP clients on port 8554
+[video4linux2,v4l2 @ 0x76a984000d80] The driver changed the time per frame from 1/30 to 1/10
+✅ 摄像头已打开: 1280x720 (格式=yuyv422)
+x264 [info]: using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2 AVX512
+x264 [info]: profile Constrained Baseline, level 3.1, 4:2:0, 8-bit
+✅ x264 编码器初始化成功
+🎬 开始采集循环...
+[INFO] New connection 127.0.0.1 (FD=6)
+[INFO] SETUP session=60029321
+🔒 [Port:7480] 绑定本地端口成功
+[INFO] PLAY session=60029321 dst=127.0.0.1:9248
+[STAT] clients=1 traffic_bytes=0
+🔓 [Port:7480] UDP Socket 已释放
+[INFO] TEARDOWN session=60029321

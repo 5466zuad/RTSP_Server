@@ -369,12 +369,17 @@ bool TcpServer::start(int port) {
                          ctx->cseq);
                 send(curr_fd, response, strlen(response), 0);
             } else if (strcmp(method, "DESCRIBE") == 0) {
+                struct sockaddr_in local_addr;
+                socklen_t local_len = sizeof(local_addr);
+                getsockname(curr_fd, (struct sockaddr*)&local_addr, &local_len);
+                std::string current_ip = inet_ntoa(local_addr.sin_addr);
+
                 const std::string fmtp_line = buildH264FmtpLine();
                 std::stringstream sdp;
                 sdp << "v=0\r\n"
-                    << "o=- 0 0 IN IP4 " << my_ip << "\r\n"
+                    << "o=- 0 0 IN IP4 " << current_ip << "\r\n"
                     << "s=EdgeGateway Live\r\n"
-                    << "c=IN IP4 " << my_ip << "\r\n"
+                    << "c=IN IP4 " << current_ip << "\r\n"
                     << "t=0 0\r\n"
                     << "m=video 0 RTP/AVP 96\r\n"
                     << "a=rtpmap:96 H264/90000\r\n"
@@ -382,10 +387,16 @@ bool TcpServer::start(int port) {
                     << "a=control:track0\r\n";
                 const std::string sdp_str = sdp.str();
 
+                std::string base_url = url;
+                if (!base_url.empty() && base_url.back() != '/') {
+                    base_url += "/";
+                }
+
                 snprintf(response, sizeof(response),
                          "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
+                         "Content-Base: %s\r\n"
                          "Content-Type: application/sdp\r\nContent-Length: %zu\r\n\r\n%s",
-                         ctx->cseq, sdp_str.size(), sdp_str.c_str());
+                         ctx->cseq, base_url.c_str(), sdp_str.size(), sdp_str.c_str());
                 send(curr_fd, response, strlen(response), 0);
             } else if (strcmp(method, "SETUP") == 0) {
                 if (!(ctx->state == SessionState::INIT || ctx->state == SessionState::READY || ctx->state == SessionState::PAUSED)) {

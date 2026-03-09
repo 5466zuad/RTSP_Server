@@ -7,8 +7,16 @@
 #include <atomic>
 #include <memory>
 #include <functional>
-#include "ThreadPool.h"
+#include <vector>
 #include "RtpSender.h"
+
+enum class SessionState {
+    INIT,
+    READY,
+    PLAYING,
+    PAUSED,
+    CLOSED
+};
 
 struct ClientContext {
     std::string ip;
@@ -19,6 +27,8 @@ struct ClientContext {
     std::shared_ptr<std::atomic<bool>> is_playing;
     std::shared_ptr<RtpSender> rtp_sender;
     bool need_headers = true; // 新连接需要等到 IDR 帧才开始推
+    SessionState state = SessionState::INIT;
+    int server_rtcp_port = 0;
 
     ClientContext() {
         is_playing = std::make_shared<std::atomic<bool>>(false);
@@ -28,7 +38,7 @@ struct ClientContext {
 
 class TcpServer {
 public:
-    TcpServer() : pool(8) {}  // 线程池 8 个工作线程
+    explicit TcpServer(int rtp_port_base = 6970, int rtp_pair_count = 256);
     bool start(int port);
 
     // 分发一帧 NALU 给所有正在播放的客户端（由采集线程回调触发）
@@ -36,11 +46,18 @@ public:
 
     void stopAllStreams();
     void resumeAllStreams();
+    int onlineClients() const;
+    uint64_t totalTrafficBytes() const;
 
 private:
-    ThreadPool pool;
+    int allocateServerRtpPort();
+    void releaseServerRtpPort(int port);
+
     std::map<int, std::shared_ptr<ClientContext>> m_clients;
-    std::mutex m_clientsMutex;
+    mutable std::mutex m_clientsMutex;
+    std::atomic<uint64_t> m_totalTrafficBytes{0};
+    mutable std::mutex m_portPoolMutex;
+    std::vector<int> m_freeRtpPorts;
 };
 
 #endif

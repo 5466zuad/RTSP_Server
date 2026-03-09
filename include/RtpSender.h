@@ -2,9 +2,9 @@
 #define RTP_SENDER_H
 
 #include <string>
+#include <cstdint>
 #include <atomic>
 #include <functional> // 👈 新增：为了使用现代 C++ 的回调函数魔法
-#include "CameraCapture.h" // 👈 引入摄像头采集模块
 
 class RtpSender {
 private:
@@ -15,8 +15,10 @@ private:
     
     // 状态维护
     uint16_t seq = 0;
+    uint32_t ssrc = 0;
     uint32_t timestamp = 0;
     int accumulated_bytes = 0;
+    std::atomic<uint32_t> failed_packets{0};
     
     // 🛑 个人专属遥控器
     std::atomic<bool>* running_flag;
@@ -28,10 +30,10 @@ public:
     RtpSender(std::string ip, int port, int local_port, std::atomic<bool>* flag);
     ~RtpSender();
     
-    void sendVideo(const std::string& filename);
-    
     // ✨ 将 NALU 打包为 RTP 发送出去（不涉及任何采集和编码）
-    void sendNalu(uint8_t* nalu_data, int nalu_size, uint32_t ts_increment, bool is_last_nalu = true);
+    // ts: 90kHz 时钟的绝对时间戳（pts）
+    void sendNalu(uint8_t* nalu_data, int nalu_size, uint32_t ts, bool is_last_nalu = true);
+    uint32_t getFailedPackets() const;
 };
 
 #endif

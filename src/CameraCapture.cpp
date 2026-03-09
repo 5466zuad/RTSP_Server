@@ -2,9 +2,13 @@
 // 功能：直接用 libavdevice (v4l2) 从 /dev/video0 采集画面，
 //       经 sws_scale 转 YUV420P，再用 x264 压缩成 H264 NALU，
 //       通过 onNalu 回调异步推出去。
-#include "../include/CameraCapture.h"
+#include "CameraCapture.h"
 #include <iostream>
 #include <cstring>
+#include <fstream>
+#include <vector>
+#include <thread>
+#include <chrono>
 
 extern "C" {
 #include <libavdevice/avdevice.h>
@@ -19,7 +23,28 @@ extern "C" {
 CameraCapture::CameraCapture() {}
 CameraCapture::~CameraCapture() {}
 
-void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluCallback onNalu) {
+void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::atomic<bool>* running_flag, NaluCallback onNalu) {
+
+    const int fps = (options.fps > 0) ? options.fps : 30;
+    const std::string video_size = std::to_string(options.width) + "x" + std::to_string(options.height);
+
+    AVFormatContext* fmt_ctx = nullptr;
+    AVCodecContext* dec_ctx = nullptr;
+    SwsContext* sws_ctx = nullptr;
+    uint8_t* yuv_data[4] = {nullptr};
+    int yuv_linesize[4] = {0};
+    bool yuv_allocated = false;
+    x264_t* encoder = nullptr;
+    x264_picture_t pic_in;
+    x264_picture_t pic_out;
+    bool pic_allocated = false;
+    AVPacket* pkt = nullptr;
+    AVFrame* raw_frame = nullptr;
+    bool need_decode = false;
+    int video_stream_idx = -1;
+    int width = 0;
+    int height = 0;
+    AVPixelFormat src_pix_fmt = AV_PIX_FMT_NONE;
 
     // ─────────────────────────────────────────────────────────
     // 1️⃣  初始化：注册所有硬件采集驱动
@@ -34,31 +59,29 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     }
 
     // 设置采集参数字典：分辨率 + 帧率
-    AVDictionary* options = nullptr;
-    av_dict_set(&options, "video_size", "1280x720", 0);
-    av_dict_set(&options, "framerate",  "30",       0);
-    av_dict_set(&options, "input_format", "yuyv422", 0); // 大多数 USB 摄像头支持
+    AVDictionary* ff_options = nullptr;
+    av_dict_set(&ff_options, "video_size", video_size.c_str(), 0);
+    av_dict_set(&ff_options, "framerate", std::to_string(fps).c_str(), 0);
+    av_dict_set(&ff_options, "input_format", options.input_format.c_str(), 0);
 
     // 打开摄像头（独占 /dev/video0）
-    AVFormatContext* fmt_ctx = avformat_alloc_context();
-    int ret = avformat_open_input(&fmt_ctx, "/dev/video0", input_fmt, &options);
-    av_dict_free(&options);
+    fmt_ctx = avformat_alloc_context();
+    int ret = avformat_open_input(&fmt_ctx, options.device.c_str(), input_fmt, &ff_options);
+    av_dict_free(&ff_options);
     if (ret < 0) {
         char err[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, err, sizeof(err));
-        std::cerr << "❌ 打开摄像头失败: " << err << std::endl;
-        return;
+        std::cerr << "❌ 打开摄像头失败: " << options.device << " err=" << err << std::endl;
+        goto cleanup;
     }
 
     // 读取流信息（得到宽高等参数）
     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
         std::cerr << "❌ 无法获取摄像头流信息" << std::endl;
-        avformat_close_input(&fmt_ctx);
-        return;
+        goto cleanup;
     }
 
     // 找到视频流索引
-    int video_stream_idx = -1;
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
         if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             video_stream_idx = i;
@@ -67,14 +90,13 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     }
     if (video_stream_idx < 0) {
         std::cerr << "❌ 摄像头中没有找到视频流" << std::endl;
-        avformat_close_input(&fmt_ctx);
-        return;
+        goto cleanup;
     }
 
     AVCodecParameters* codecpar = fmt_ctx->streams[video_stream_idx]->codecpar;
-    int width  = codecpar->width;
-    int height = codecpar->height;
-    AVPixelFormat src_pix_fmt = (AVPixelFormat)codecpar->format;
+    width = codecpar->width;
+    height = codecpar->height;
+    src_pix_fmt = (AVPixelFormat)codecpar->format;
 
     std::cout << "✅ 摄像头已打开: " << width << "x" << height
               << " (格式=" << av_get_pix_fmt_name(src_pix_fmt) << ")" << std::endl;
@@ -83,35 +105,50 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     // 2️⃣  如果摄像头吐出压缩格式（如 MJPEG），需要解码器
     // ─────────────────────────────────────────────────────────
     const AVCodec* decoder = avcodec_find_decoder(codecpar->codec_id);
-    AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
-    avcodec_parameters_to_context(dec_ctx, codecpar);
-    bool need_decode = (codecpar->codec_id != AV_CODEC_ID_RAWVIDEO);
+    if (!decoder && codecpar->codec_id != AV_CODEC_ID_RAWVIDEO) {
+        std::cerr << "❌ 找不到对应解码器" << std::endl;
+        goto cleanup;
+    }
+
+    dec_ctx = avcodec_alloc_context3(decoder);
+    if (!dec_ctx) {
+        std::cerr << "❌ 分配解码器上下文失败" << std::endl;
+        goto cleanup;
+    }
+
+    if (avcodec_parameters_to_context(dec_ctx, codecpar) < 0) {
+        std::cerr << "❌ 解码器参数填充失败" << std::endl;
+        goto cleanup;
+    }
+
+    need_decode = (codecpar->codec_id != AV_CODEC_ID_RAWVIDEO);
     if (need_decode) {
         if (avcodec_open2(dec_ctx, decoder, nullptr) < 0) {
             std::cerr << "❌ 解码器打开失败" << std::endl;
-        } else {
-            std::cout << "✅ 已启用解码器: " << decoder->name << std::endl;
+            goto cleanup;
         }
+        std::cout << "✅ 已启用解码器: " << decoder->name << std::endl;
     }
 
     // ─────────────────────────────────────────────────────────
     // 3️⃣  sws_scale 转换上下文：任意格式 → YUV420P
     // ─────────────────────────────────────────────────────────
-    SwsContext* sws_ctx = sws_getContext(
+    sws_ctx = sws_getContext(
         width, height, need_decode ? dec_ctx->pix_fmt : src_pix_fmt,
         width, height, AV_PIX_FMT_YUV420P,
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
     if (!sws_ctx) {
         std::cerr << "❌ sws_getContext 失败" << std::endl;
-        avformat_close_input(&fmt_ctx);
-        return;
+        goto cleanup;
     }
 
     // 申请 YUV 输出帧的内存（plane[0]=Y, plane[1]=U, plane[2]=V）
-    uint8_t* yuv_data[4] = {nullptr};
-    int      yuv_linesize[4];
-    av_image_alloc(yuv_data, yuv_linesize, width, height, AV_PIX_FMT_YUV420P, 32);
+    if (av_image_alloc(yuv_data, yuv_linesize, width, height, AV_PIX_FMT_YUV420P, 32) < 0) {
+        std::cerr << "❌ YUV 缓冲区分配失败" << std::endl;
+        goto cleanup;
+    }
+    yuv_allocated = true;
 
     // ─────────────────────────────────────────────────────────
     // 4️⃣  x264 编码器初始化
@@ -121,7 +158,7 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     param.i_threads    = 0;     // 自动选线程数
     param.i_width      = width;
     param.i_height     = height;
-    param.i_fps_num    = 30;
+    param.i_fps_num    = fps;
     param.i_fps_den    = 1;
     param.i_keyint_max = 60;
     param.b_intra_refresh = 0;
@@ -129,27 +166,29 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
     param.rc.f_rf_constant = 20.0f;
     x264_param_apply_profile(&param, "main");
 
-    x264_t* encoder = x264_encoder_open(&param);
+    encoder = x264_encoder_open(&param);
     if (!encoder) {
         std::cerr << "❌ x264 编码器初始化失败" << std::endl;
-        av_freep(&yuv_data[0]);
-        sws_freeContext(sws_ctx);
-        avformat_close_input(&fmt_ctx);
-        return;
+        goto cleanup;
     }
     std::cout << "✅ x264 编码器初始化成功" << std::endl;
 
-    x264_picture_t pic_in, pic_out;
     x264_picture_alloc(&pic_in, X264_CSP_I420, width, height);
+    pic_allocated = true;
 
     // ─────────────────────────────────────────────────────────
     // 5️⃣  主采集循环
     // ─────────────────────────────────────────────────────────
-    AVPacket* pkt = av_packet_alloc();
-    AVFrame*  raw_frame = av_frame_alloc(); // 解码后的原始帧
+    pkt = av_packet_alloc();
+    raw_frame = av_frame_alloc(); // 解码后的原始帧
+    if (!pkt || !raw_frame) {
+        std::cerr << "❌ 采集缓存申请失败" << std::endl;
+        goto cleanup;
+    }
 
     uint32_t pts_counter = 0;
-    const uint32_t pts_step = 90000 / 30; // 90kHz 时钟，每帧 3000
+    const uint32_t pts_step = 90000 / static_cast<uint32_t>(fps);
+    int consecutive_read_failures = 0;
 
     std::cout << "🎬 开始采集循环..." << std::endl;
 
@@ -157,10 +196,19 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
 
         // 从摄像头读取一个数据包
         if (av_read_frame(fmt_ctx, pkt) < 0) {
-            std::cerr << "⚠️  av_read_frame 失败，尝试重新读取..." << std::endl;
+            consecutive_read_failures++;
             av_packet_unref(pkt);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (consecutive_read_failures > 100) {
+                std::cerr << "❌ 摄像头读取连续失败超过阈值，停止推流" << std::endl;
+                if (running_flag) {
+                    *running_flag = false;
+                }
+                break;
+            }
             continue;
         }
+        consecutive_read_failures = 0;
 
         if (pkt->stream_index != video_stream_idx) {
             av_packet_unref(pkt);
@@ -171,7 +219,7 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
         uint8_t* src_data[4]     = {nullptr};
         int      src_linesize[4] = {0};
 
-        if (need_decode) {
+        if (need_decode && dec_ctx) {
             // MJPEG / 其他压缩格式需要先解码
             if (avcodec_send_packet(dec_ctx, pkt) >= 0) {
                 if (avcodec_receive_frame(dec_ctx, raw_frame) >= 0) {
@@ -216,17 +264,91 @@ void CameraCapture::startCaptureAndEncode(std::atomic<bool>* running_flag, NaluC
         pts_counter += pts_step;
     }
 
+cleanup:
     // ─────────────────────────────────────────────────────────
     // 6️⃣  清理资源
     // ─────────────────────────────────────────────────────────
     std::cout << "🛑 采集线程正在清理资源..." << std::endl;
-    x264_picture_clean(&pic_in);
-    x264_encoder_close(encoder);
-    av_frame_free(&raw_frame);
-    av_packet_free(&pkt);
-    av_freep(&yuv_data[0]);
-    sws_freeContext(sws_ctx);
-    if (need_decode) avcodec_free_context(&dec_ctx);
-    avformat_close_input(&fmt_ctx);
+    if (pic_allocated) {
+        x264_picture_clean(&pic_in);
+    }
+    if (encoder) {
+        x264_encoder_close(encoder);
+    }
+    if (raw_frame) {
+        av_frame_free(&raw_frame);
+    }
+    if (pkt) {
+        av_packet_free(&pkt);
+    }
+    if (yuv_allocated) {
+        av_freep(&yuv_data[0]);
+    }
+    if (sws_ctx) {
+        sws_freeContext(sws_ctx);
+    }
+    if (dec_ctx) {
+        avcodec_free_context(&dec_ctx);
+    }
+    if (fmt_ctx) {
+        avformat_close_input(&fmt_ctx);
+    }
     std::cout << "✅ 采集线程已安全退出" << std::endl;
+}
+
+// 从本地 H264 文件读取（Annex-B，带 start-code 0x00000001），并以指定帧率推送 NALU
+void CameraCapture::startCaptureFromFile(const std::string& filename, std::atomic<bool>* running_flag, NaluCallback onNalu) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "❌ 无法打开 H264 文件: " << filename << std::endl;
+        return;
+    }
+
+    std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (buffer.empty()) {
+        std::cerr << "❌ H264 文件为空: " << filename << std::endl;
+        return;
+    }
+
+    std::cout << "📁 使用本地 H264 文件推流: " << filename << std::endl;
+
+    // 简单按 start-code 拆分 NALU
+    size_t pos = 0;
+    uint32_t pts_counter = 0;
+    const uint32_t pts_step = 90000 / 30; // 模拟 30fps
+
+    while (running_flag && *running_flag) {
+        // 找到下一个 start code
+        while (pos + 4 <= buffer.size()) {
+            if (buffer[pos] == 0 && buffer[pos+1] == 0 && buffer[pos+2] == 0 && buffer[pos+3] == 1) break;
+            pos++;
+        }
+        if (pos + 4 > buffer.size()) break;
+        size_t start = pos + 4;
+        size_t next = start;
+        while (next + 4 <= buffer.size()) {
+            if (buffer[next] == 0 && buffer[next+1] == 0 && buffer[next+2] == 0 && buffer[next+3] == 1) break;
+            next++;
+        }
+        size_t nalu_size = (next <= buffer.size()) ? (next - start) : (buffer.size() - start);
+        if (nalu_size == 0) break;
+
+        // 拷贝 NALU
+        std::vector<uint8_t> nalu(buffer.begin() + start, buffer.begin() + start + nalu_size);
+
+        if (onNalu) {
+            onNalu(nalu.data(), (int)nalu.size(), pts_counter);
+        }
+
+        pts_counter += pts_step;
+        pos = next;
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+
+        if (pos >= buffer.size()) {
+            // 循环播放
+            pos = 0;
+        }
+    }
+
+    std::cout << "✅ H264 文件推流线程退出" << std::endl;
 }

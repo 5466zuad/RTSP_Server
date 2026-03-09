@@ -1,8 +1,31 @@
-build/
-bin/
+# Build directories
+/build/
+/bin/
+
+# CMake outputs
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Binaries and libraries
 *.o
 *.a
 *.so
+*.so.*
+rtsp_server
+
+# Logs and runtime artifacts
+*.log
 server_log.txt
+
+# Media test artifacts
 *.h264
+
+# IDE/editor
 .vscode/
+.idea/
+
+# OS
+.DS_Store

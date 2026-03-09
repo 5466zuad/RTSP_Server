@@ -22,6 +22,56 @@ std::mutex g_sps_pps_mutex;
 std::vector<uint8_t> g_cached_sps;
 std::vector<uint8_t> g_cached_pps;
 
+std::string base64Encode(const uint8_t* data, size_t len) {
+    static const char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+
+    for (size_t i = 0; i < len; i += 3) {
+        const uint32_t octet_a = data[i];
+        const uint32_t octet_b = (i + 1 < len) ? data[i + 1] : 0;
+        const uint32_t octet_c = (i + 2 < len) ? data[i + 2] : 0;
+        const uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+        out.push_back(kTable[(triple >> 18) & 0x3F]);
+        out.push_back(kTable[(triple >> 12) & 0x3F]);
+        out.push_back((i + 1 < len) ? kTable[(triple >> 6) & 0x3F] : '=');
+        out.push_back((i + 2 < len) ? kTable[triple & 0x3F] : '=');
+    }
+
+    return out;
+}
+
+std::string buildH264FmtpLine() {
+    std::vector<uint8_t> sps;
+    std::vector<uint8_t> pps;
+    {
+        std::lock_guard<std::mutex> lock(g_sps_pps_mutex);
+        sps = g_cached_sps;
+        pps = g_cached_pps;
+    }
+
+    if (sps.empty() || pps.empty()) {
+        return "a=fmtp:96 packetization-mode=1\r\n";
+    }
+
+    char profile_level_id[7] = {0};
+    if (sps.size() >= 4) {
+        snprintf(profile_level_id, sizeof(profile_level_id), "%02X%02X%02X",
+                 sps[1], sps[2], sps[3]);
+    } else {
+        snprintf(profile_level_id, sizeof(profile_level_id), "42E01F");
+    }
+
+    return "a=fmtp:96 packetization-mode=1;profile-level-id=" +
+           std::string(profile_level_id) +
+           ";sprop-parameter-sets=" +
+           base64Encode(sps.data(), sps.size()) + "," +
+           base64Encode(pps.data(), pps.size()) + "\r\n";
+}
+
 std::string generateSessionId() {
     static std::random_device rd;
     static std::mt19937 gen(rd());
@@ -319,6 +369,7 @@ bool TcpServer::start(int port) {
                          ctx->cseq);
                 send(curr_fd, response, strlen(response), 0);
             } else if (strcmp(method, "DESCRIBE") == 0) {
+                const std::string fmtp_line = buildH264FmtpLine();
                 std::stringstream sdp;
                 sdp << "v=0\r\n"
                     << "o=- 0 0 IN IP4 " << my_ip << "\r\n"
@@ -327,7 +378,7 @@ bool TcpServer::start(int port) {
                     << "t=0 0\r\n"
                     << "m=video 0 RTP/AVP 96\r\n"
                     << "a=rtpmap:96 H264/90000\r\n"
-                    << "a=fmtp:96 packetization-mode=1\r\n"
+                    << fmtp_line
                     << "a=control:track0\r\n";
                 const std::string sdp_str = sdp.str();
 

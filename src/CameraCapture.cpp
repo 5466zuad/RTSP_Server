@@ -10,6 +10,66 @@
 #include <thread>
 #include <chrono>
 
+namespace {
+struct NaluRange {
+    size_t offset;
+    size_t size;
+};
+
+bool findAnnexBStartCode(const std::vector<uint8_t>& buffer,
+                         size_t from,
+                         size_t& code_pos,
+                         size_t& code_len) {
+    if (buffer.size() < 3 || from >= buffer.size()) {
+        return false;
+    }
+
+    for (size_t i = from; i + 2 < buffer.size(); ++i) {
+        // Prefer 4-byte start code matching first to avoid ambiguity.
+        if (i + 3 < buffer.size() &&
+            buffer[i] == 0 && buffer[i + 1] == 0 && buffer[i + 2] == 0 && buffer[i + 3] == 1) {
+            code_pos = i;
+            code_len = 4;
+            return true;
+        }
+        if (buffer[i] == 0 && buffer[i + 1] == 0 && buffer[i + 2] == 1) {
+            code_pos = i;
+            code_len = 3;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<NaluRange> extractAnnexBNalus(const std::vector<uint8_t>& buffer) {
+    std::vector<NaluRange> nalus;
+    size_t search_pos = 0;
+
+    size_t start_code_pos = 0;
+    size_t start_code_len = 0;
+    while (findAnnexBStartCode(buffer, search_pos, start_code_pos, start_code_len)) {
+        const size_t nalu_start = start_code_pos + start_code_len;
+
+        size_t next_code_pos = 0;
+        size_t next_code_len = 0;
+        if (findAnnexBStartCode(buffer, nalu_start, next_code_pos, next_code_len)) {
+            if (next_code_pos > nalu_start) {
+                nalus.push_back({nalu_start, next_code_pos - nalu_start});
+            }
+            search_pos = next_code_pos;
+            continue;
+        }
+
+        if (nalu_start < buffer.size()) {
+            nalus.push_back({nalu_start, buffer.size() - nalu_start});
+        }
+        break;
+    }
+
+    return nalus;
+}
+} // namespace
+
 extern "C" {
 #include <libavdevice/avdevice.h>
 #include <libavformat/avformat.h>
@@ -45,6 +105,11 @@ void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::at
     int width = 0;
     int height = 0;
     AVPixelFormat src_pix_fmt = AV_PIX_FMT_NONE;
+    uint32_t pts_counter = 0;
+    uint32_t pts_step = 0;
+    int consecutive_read_failures = 0;
+    AVCodecParameters* codecpar = nullptr;
+    const AVCodec* decoder = nullptr;
 
     // ─────────────────────────────────────────────────────────
     // 1️⃣  初始化：注册所有硬件采集驱动
@@ -93,7 +158,7 @@ void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::at
         goto cleanup;
     }
 
-    AVCodecParameters* codecpar = fmt_ctx->streams[video_stream_idx]->codecpar;
+    codecpar = fmt_ctx->streams[video_stream_idx]->codecpar;
     width = codecpar->width;
     height = codecpar->height;
     src_pix_fmt = (AVPixelFormat)codecpar->format;
@@ -104,7 +169,7 @@ void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::at
     // ─────────────────────────────────────────────────────────
     // 2️⃣  如果摄像头吐出压缩格式（如 MJPEG），需要解码器
     // ─────────────────────────────────────────────────────────
-    const AVCodec* decoder = avcodec_find_decoder(codecpar->codec_id);
+    decoder = avcodec_find_decoder(codecpar->codec_id);
     if (!decoder && codecpar->codec_id != AV_CODEC_ID_RAWVIDEO) {
         std::cerr << "❌ 找不到对应解码器" << std::endl;
         goto cleanup;
@@ -186,9 +251,10 @@ void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::at
         goto cleanup;
     }
 
-    uint32_t pts_counter = 0;
-    const uint32_t pts_step = 90000 / static_cast<uint32_t>(fps);
-    int consecutive_read_failures = 0;
+    // 初始化时间戳相关变量
+    pts_counter = 0;
+    pts_step = 90000 / static_cast<uint32_t>(fps);
+    consecutive_read_failures = 0;
 
     std::cout << "🎬 开始采集循环..." << std::endl;
 
@@ -312,42 +378,33 @@ void CameraCapture::startCaptureFromFile(const std::string& filename, std::atomi
 
     std::cout << "📁 使用本地 H264 文件推流: " << filename << std::endl;
 
-    // 简单按 start-code 拆分 NALU
-    size_t pos = 0;
+    // 预解析 Annex-B，兼容 00 00 01 与 00 00 00 01 两种 start code。
+    const auto nalus = extractAnnexBNalus(buffer);
+    if (nalus.empty()) {
+        std::cerr << "❌ 未在文件中找到有效 Annex-B NALU: " << filename << std::endl;
+        return;
+    }
+    std::cout << "✅ 检测到 " << nalus.size() << " 个 NALU，开始循环推流" << std::endl;
+
+    size_t nalu_index = 0;
     uint32_t pts_counter = 0;
     const uint32_t pts_step = 90000 / 30; // 模拟 30fps
+    const auto frame_interval = std::chrono::milliseconds(33);
 
     while (running_flag && *running_flag) {
-        // 找到下一个 start code
-        while (pos + 4 <= buffer.size()) {
-            if (buffer[pos] == 0 && buffer[pos+1] == 0 && buffer[pos+2] == 0 && buffer[pos+3] == 1) break;
-            pos++;
+        const auto& nalu = nalus[nalu_index];
+        if (nalu.size == 0 || nalu.offset + nalu.size > buffer.size()) {
+            nalu_index = (nalu_index + 1) % nalus.size();
+            continue;
         }
-        if (pos + 4 > buffer.size()) break;
-        size_t start = pos + 4;
-        size_t next = start;
-        while (next + 4 <= buffer.size()) {
-            if (buffer[next] == 0 && buffer[next+1] == 0 && buffer[next+2] == 0 && buffer[next+3] == 1) break;
-            next++;
-        }
-        size_t nalu_size = (next <= buffer.size()) ? (next - start) : (buffer.size() - start);
-        if (nalu_size == 0) break;
-
-        // 拷贝 NALU
-        std::vector<uint8_t> nalu(buffer.begin() + start, buffer.begin() + start + nalu_size);
 
         if (onNalu) {
-            onNalu(nalu.data(), (int)nalu.size(), pts_counter);
+            onNalu(buffer.data() + nalu.offset, static_cast<int>(nalu.size), pts_counter);
         }
 
         pts_counter += pts_step;
-        pos = next;
-        std::this_thread::sleep_for(std::chrono::milliseconds(33));
-
-        if (pos >= buffer.size()) {
-            // 循环播放
-            pos = 0;
-        }
+        nalu_index = (nalu_index + 1) % nalus.size();
+        std::this_thread::sleep_for(frame_interval);
     }
 
     std::cout << "✅ H264 文件推流线程退出" << std::endl;

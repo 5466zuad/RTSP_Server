@@ -226,6 +226,7 @@ void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::at
     param.i_fps_num    = fps;
     param.i_fps_den    = 1;
     param.i_keyint_max = 60;
+    param.b_repeat_headers = 1; // 关键！确保每个关键帧都带有 SPS/PPS，否则后接入的客户端无法解码
     param.b_intra_refresh = 0;
     param.rc.i_rc_method  = X264_RC_CRF;
     param.rc.f_rf_constant = 20.0f;
@@ -262,6 +263,7 @@ void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::at
 
         // 从摄像头读取一个数据包
         if (av_read_frame(fmt_ctx, pkt) < 0) {
+        std::cout << "av_read_frame returned >=0\n";
             consecutive_read_failures++;
             av_packet_unref(pkt);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -323,7 +325,14 @@ void CameraCapture::startCaptureAndEncode(const CaptureOptions& options, std::at
 
         if (frame_size > 0 && onNalu) {
             for (int i = 0; i < num_nals; ++i) {
-                onNalu(nals[i].p_payload, nals[i].i_payload, pts_counter);
+                uint8_t* p = nals[i].p_payload;
+                int size = nals[i].i_payload;
+                if (size >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) {
+                    p += 4; size -= 4;
+                } else if (size >= 3 && p[0] == 0 && p[1] == 0 && p[2] == 1) {
+                    p += 3; size -= 3;
+                }
+                onNalu(p, size, pts_counter);
             }
         }
 

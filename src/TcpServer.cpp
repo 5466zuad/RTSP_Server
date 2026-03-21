@@ -1,9 +1,11 @@
 #include "TcpServer.h"
 #include <arpa/inet.h>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -14,8 +16,6 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-extern std::atomic<bool> g_running;
 
 namespace {
 std::mutex g_sps_pps_mutex;
@@ -107,6 +107,64 @@ std::string getLocalIP() {
     return ip;
 }
 
+std::string normalizeStreamPath(const std::string& input) {
+    std::string path = input;
+    while (!path.empty() && std::isspace(static_cast<unsigned char>(path.front()))) {
+        path.erase(path.begin());
+    }
+    while (!path.empty() && std::isspace(static_cast<unsigned char>(path.back()))) {
+        path.pop_back();
+    }
+    if (path.empty()) return "";
+    if (path[0] != '/') {
+        path.insert(path.begin(), '/');
+    }
+    while (path.size() > 1 && path.back() == '/') {
+        path.pop_back();
+    }
+    return path;
+}
+
+std::string extractPathFromUrl(const std::string& url) {
+    if (url.empty()) return "/";
+    const std::string scheme = "rtsp://";
+    size_t path_pos = std::string::npos;
+    if (url.rfind(scheme, 0) == 0) {
+        const size_t host_end = url.find('/', scheme.size());
+        if (host_end != std::string::npos) {
+            path_pos = host_end;
+        }
+    } else if (url[0] == '/') {
+        path_pos = 0;
+    }
+
+    if (path_pos == std::string::npos) {
+        return "/";
+    }
+
+    std::string path = url.substr(path_pos);
+    const size_t query_pos = path.find('?');
+    if (query_pos != std::string::npos) {
+        path = path.substr(0, query_pos);
+    }
+    if (path.empty()) return "/";
+    while (path.size() > 1 && path.back() == '/') {
+        path.pop_back();
+    }
+    return path;
+}
+
+bool pathMatches(const std::string& request_path, const std::string& stream_path) {
+    if (stream_path.empty() || stream_path == "/") {
+        return true;
+    }
+    if (request_path == stream_path) {
+        return true;
+    }
+    const std::string prefix = stream_path + "/";
+    return request_path.rfind(prefix, 0) == 0;
+}
+
 bool extractHeader(const char* request, const char* key, std::string& value) {
     if (!request || !key) return false;
     std::string needle = std::string("\r\n") + key + ":";
@@ -137,6 +195,26 @@ bool sessionMatches(const std::string& expect, const char* request) {
     if (!extractHeader(request, "Session", session_header)) return false;
     return session_header == expect;
 }
+
+bool parseContentLength(const std::string& header, size_t& out_len) {
+    const char* keys[] = {"Content-Length:", "Content-length:"};
+    for (const char* key : keys) {
+        size_t pos = header.find(key);
+        if (pos == std::string::npos) continue;
+        pos += strlen(key);
+        while (pos < header.size() && header[pos] == ' ') pos++;
+        size_t end = pos;
+        while (end < header.size() && std::isdigit(static_cast<unsigned char>(header[end]))) {
+            end++;
+        }
+        if (end == pos) return false;
+        out_len = static_cast<size_t>(std::strtoul(header.c_str() + pos, nullptr, 10));
+        return true;
+    }
+    return false;
+}
+
+constexpr size_t kMaxRecvBufferBytes = 64 * 1024;
 } // namespace
 
 TcpServer::TcpServer(int rtp_port_base, int rtp_pair_count) {
@@ -237,10 +315,12 @@ void TcpServer::dispatchNalu(uint8_t* data, int size, uint32_t timestamp) {
     }
 }
 
-bool TcpServer::start(int port) {
+bool TcpServer::start(const std::string& bind_ip, int port, const std::string& stream_path, std::atomic<bool>* running_flag) {
     std::cout << "[INFO] Epoll RTSP server starting..." << std::endl;
     const std::string my_ip = getLocalIP();
     std::cout << "[INFO] Host IP: " << my_ip << std::endl;
+
+    m_streamPath = normalizeStreamPath(stream_path);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return false;
@@ -251,7 +331,15 @@ bool TcpServer::start(int port) {
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind_ip.empty() || bind_ip == "0.0.0.0") {
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        if (inet_pton(AF_INET, bind_ip.c_str(), &server_addr.sin_addr) != 1) {
+            std::cerr << "[ERROR] Invalid bind IP: " << bind_ip << std::endl;
+            close(server_fd);
+            return false;
+        }
+    }
     server_addr.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
@@ -282,7 +370,7 @@ bool TcpServer::start(int port) {
 
     std::cout << "[INFO] Waiting RTSP clients on port " << port << std::endl;
 
-    while (g_running) {
+    while (running_flag && *running_flag) {
         int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 200);
         if (n == -1) {
             if (errno == EINTR) continue;
@@ -310,6 +398,7 @@ bool TcpServer::start(int port) {
                     std::lock_guard<std::mutex> lock(m_clientsMutex);
                     auto client = std::make_shared<ClientContext>();
                     client->ip = ip;
+                    client->connected_at = std::chrono::system_clock::now();
                     m_clients[client_fd] = client;
                 }
                 std::cout << "[INFO] New connection " << ip << " (FD=" << client_fd << ")" << std::endl;
@@ -350,220 +439,309 @@ bool TcpServer::start(int port) {
                 ctx = entry;
             }
 
-            char method[16] = {0};
-            char url[128] = {0};
-            char version[16] = {0};
-            sscanf(buffer, "%15s %127s %15s", method, url, version);
-
-            const char* cseq_ptr = strstr(buffer, "CSeq: ");
-            if (cseq_ptr) {
-                sscanf(cseq_ptr, "CSeq: %d", &ctx->cseq);
-            }
-
-            char response[2048] = {0};
-
-            if (strcmp(method, "OPTIONS") == 0) {
-                snprintf(response, sizeof(response),
-                         "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
-                         "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n\r\n",
-                         ctx->cseq);
-                send(curr_fd, response, strlen(response), 0);
-            } else if (strcmp(method, "DESCRIBE") == 0) {
-                struct sockaddr_in local_addr;
-                socklen_t local_len = sizeof(local_addr);
-                getsockname(curr_fd, (struct sockaddr*)&local_addr, &local_len);
-                std::string current_ip = inet_ntoa(local_addr.sin_addr);
-
-                const std::string fmtp_line = buildH264FmtpLine();
-                std::stringstream sdp;
-                sdp << "v=0\r\n"
-                    << "o=- 0 0 IN IP4 " << current_ip << "\r\n"
-                    << "s=EdgeGateway Live\r\n"
-                    << "c=IN IP4 " << current_ip << "\r\n"
-                    << "t=0 0\r\n"
-                    << "m=video 0 RTP/AVP 96\r\n"
-                    << "a=rtpmap:96 H264/90000\r\n"
-                    << fmtp_line
-                    << "a=control:track0\r\n";
-                const std::string sdp_str = sdp.str();
-
-                std::string base_url = url;
-                if (!base_url.empty() && base_url.back() != '/') {
-                    base_url += "/";
-                }
-
-                snprintf(response, sizeof(response),
-                         "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
-                         "Content-Base: %s\r\n"
-                         "Content-Type: application/sdp\r\nContent-Length: %zu\r\n\r\n%s",
-                         ctx->cseq, base_url.c_str(), sdp_str.size(), sdp_str.c_str());
-                send(curr_fd, response, strlen(response), 0);
-            } else if (strcmp(method, "SETUP") == 0) {
-                if (!(ctx->state == SessionState::INIT || ctx->state == SessionState::READY || ctx->state == SessionState::PAUSED)) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                const char* transport_ptr = strstr(buffer, "Transport:");
-                if (transport_ptr && strstr(transport_ptr, "RTP/AVP/TCP")) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                const char* port_ptr = strstr(buffer, "client_port=");
-                if (!port_ptr) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 400 Bad Request\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                int rtcp_port = 0;
-                if (sscanf(port_ptr, "client_port=%d-%d", &ctx->client_port, &rtcp_port) <= 0) {
-                    if (sscanf(port_ptr, "client_port=%d", &ctx->client_port) <= 0) {
-                        snprintf(response, sizeof(response),
-                                 "RTSP/1.0 400 Bad Request\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                        send(curr_fd, response, strlen(response), 0);
-                        continue;
-                    }
-                }
-
-                if (ctx->server_rtp_port > 0) {
-                    releaseServerRtpPort(ctx->server_rtp_port);
-                    ctx->server_rtp_port = 0;
-                    ctx->server_rtcp_port = 0;
-                }
-
-                const int allocated_port = allocateServerRtpPort();
-                if (allocated_port <= 0) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 453 Not Enough Bandwidth\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                ctx->server_rtp_port = allocated_port;
-                ctx->server_rtcp_port = allocated_port + 1;
-                if (ctx->session_id.empty()) {
-                    ctx->session_id = generateSessionId();
-                }
-                ctx->state = SessionState::READY;
-
-                snprintf(response, sizeof(response),
-                         "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
-                         "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=%d-%d\r\n"
-                         "Session: %s\r\n\r\n",
-                         ctx->cseq,
-                         ctx->client_port, ctx->client_port + 1,
-                         ctx->server_rtp_port, ctx->server_rtcp_port,
-                         ctx->session_id.c_str());
-                send(curr_fd, response, strlen(response), 0);
-                std::cout << "[INFO] SETUP session=" << ctx->session_id << std::endl;
-            } else if (strcmp(method, "PLAY") == 0) {
-                if (!sessionMatches(ctx->session_id, buffer)) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                if (!(ctx->state == SessionState::READY || ctx->state == SessionState::PAUSED)) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                if (ctx->client_port <= 0 || ctx->server_rtp_port <= 0) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                if (!ctx->rtp_sender) {
-                    ctx->rtp_sender = std::make_shared<RtpSender>(
-                        ctx->ip, ctx->client_port, ctx->server_rtp_port, ctx->is_playing.get());
-                    ctx->rtp_sender->onTraffic = [this](int bytes) {
-                        m_totalTrafficBytes.fetch_add(static_cast<uint64_t>(bytes), std::memory_order_relaxed);
-                    };
-                }
-
-                *(ctx->is_playing) = true;
-                ctx->need_headers = true;
-                ctx->state = SessionState::PLAYING;
-
-                snprintf(response, sizeof(response),
-                         "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
-                         "Session: %s\r\nRange: npt=0.000-\r\n\r\n",
-                         ctx->cseq, ctx->session_id.c_str());
-                send(curr_fd, response, strlen(response), 0);
-                std::cout << "[INFO] PLAY session=" << ctx->session_id
-                          << " dst=" << ctx->ip << ":" << ctx->client_port << std::endl;
-            } else if (strcmp(method, "PAUSE") == 0) {
-                if (!sessionMatches(ctx->session_id, buffer)) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                if (ctx->state != SessionState::PLAYING) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                *(ctx->is_playing) = false;
-                ctx->state = SessionState::PAUSED;
-                snprintf(response, sizeof(response),
-                         "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n",
-                         ctx->cseq, ctx->session_id.c_str());
-                send(curr_fd, response, strlen(response), 0);
-                std::cout << "[INFO] PAUSE session=" << ctx->session_id << std::endl;
-            } else if (strcmp(method, "TEARDOWN") == 0) {
-                if (!sessionMatches(ctx->session_id, buffer)) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                if (!(ctx->state == SessionState::READY || ctx->state == SessionState::PLAYING || ctx->state == SessionState::PAUSED)) {
-                    snprintf(response, sizeof(response),
-                             "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                    send(curr_fd, response, strlen(response), 0);
-                    continue;
-                }
-
-                *(ctx->is_playing) = false;
-                ctx->rtp_sender.reset();
-                releaseServerRtpPort(ctx->server_rtp_port);
-                ctx->server_rtp_port = 0;
-                ctx->server_rtcp_port = 0;
-                ctx->state = SessionState::CLOSED;
-
-                snprintf(response, sizeof(response),
-                         "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n",
-                         ctx->cseq, ctx->session_id.c_str());
-                send(curr_fd, response, strlen(response), 0);
-
+            ctx->recv_buffer.append(buffer, static_cast<size_t>(bytes_read));
+            if (ctx->recv_buffer.size() > kMaxRecvBufferBytes) {
+                std::shared_ptr<ClientContext> dead;
                 {
                     std::lock_guard<std::mutex> lock(m_clientsMutex);
-                    m_clients.erase(curr_fd);
+                    auto it = m_clients.find(curr_fd);
+                    if (it != m_clients.end()) {
+                        dead = it->second;
+                        m_clients.erase(it);
+                    }
+                }
+                if (dead) {
+                    *(dead->is_playing) = false;
+                    dead->rtp_sender.reset();
+                    releaseServerRtpPort(dead->server_rtp_port);
+                    dead->server_rtp_port = 0;
+                    dead->server_rtcp_port = 0;
+                    dead->state = SessionState::CLOSED;
                 }
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr_fd, nullptr);
                 close(curr_fd);
-                std::cout << "[INFO] TEARDOWN session=" << ctx->session_id << std::endl;
-            } else {
-                snprintf(response, sizeof(response),
-                         "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %d\r\n\r\n", ctx->cseq);
-                send(curr_fd, response, strlen(response), 0);
+                std::cout << "[WARN] Client recv buffer exceeded limit, closing fd="
+                          << curr_fd << std::endl;
+                continue;
+            }
+
+            auto handleRequest = [&](const std::string& request) -> bool {
+                const char* req = request.c_str();
+                char method[16] = {0};
+                char url[128] = {0};
+                char version[16] = {0};
+                sscanf(req, "%15s %127s %15s", method, url, version);
+                const std::string request_url = url;
+                const std::string request_path = extractPathFromUrl(request_url);
+                if (!request_url.empty()) {
+                    ctx->url = request_url;
+                }
+
+                const char* cseq_ptr = strstr(req, "CSeq: ");
+                if (cseq_ptr) {
+                    sscanf(cseq_ptr, "CSeq: %d", &ctx->cseq);
+                }
+
+                char response[2048] = {0};
+
+                if (strcmp(method, "OPTIONS") == 0) {
+                    snprintf(response, sizeof(response),
+                             "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
+                             "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n\r\n",
+                             ctx->cseq);
+                    send(curr_fd, response, strlen(response), 0);
+                } else if (strcmp(method, "DESCRIBE") == 0) {
+                    if (!pathMatches(request_path, m_streamPath)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 404 Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+                    struct sockaddr_in local_addr;
+                    socklen_t local_len = sizeof(local_addr);
+                    getsockname(curr_fd, (struct sockaddr*)&local_addr, &local_len);
+                    std::string current_ip = inet_ntoa(local_addr.sin_addr);
+
+                    const std::string fmtp_line = buildH264FmtpLine();
+                    std::stringstream sdp;
+                    sdp << "v=0\r\n"
+                        << "o=- 0 0 IN IP4 " << current_ip << "\r\n"
+                        << "s=EdgeGateway Live\r\n"
+                        << "c=IN IP4 " << current_ip << "\r\n"
+                        << "t=0 0\r\n"
+                        << "m=video 0 RTP/AVP 96\r\n"
+                        << "a=rtpmap:96 H264/90000\r\n"
+                        << fmtp_line
+                        << "a=control:track0\r\n";
+                    const std::string sdp_str = sdp.str();
+
+                    std::string base_url = url;
+                    if (!base_url.empty() && base_url.back() != '/') {
+                        base_url += "/";
+                    }
+
+                    snprintf(response, sizeof(response),
+                             "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
+                             "Content-Base: %s\r\n"
+                             "Content-Type: application/sdp\r\nContent-Length: %zu\r\n\r\n%s",
+                             ctx->cseq, base_url.c_str(), sdp_str.size(), sdp_str.c_str());
+                    send(curr_fd, response, strlen(response), 0);
+                } else if (strcmp(method, "SETUP") == 0) {
+                    if (!pathMatches(request_path, m_streamPath)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 404 Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+                    if (!(ctx->state == SessionState::INIT || ctx->state == SessionState::READY || ctx->state == SessionState::PAUSED)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    const char* transport_ptr = strstr(req, "Transport:");
+                    if (transport_ptr && strstr(transport_ptr, "RTP/AVP/TCP")) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    const char* port_ptr = strstr(req, "client_port=");
+                    if (!port_ptr) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 400 Bad Request\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    int rtcp_port = 0;
+                    if (sscanf(port_ptr, "client_port=%d-%d", &ctx->client_port, &rtcp_port) <= 0) {
+                        if (sscanf(port_ptr, "client_port=%d", &ctx->client_port) <= 0) {
+                            snprintf(response, sizeof(response),
+                                     "RTSP/1.0 400 Bad Request\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                            send(curr_fd, response, strlen(response), 0);
+                            return false;
+                        }
+                    }
+
+                    if (ctx->server_rtp_port > 0) {
+                        releaseServerRtpPort(ctx->server_rtp_port);
+                        ctx->server_rtp_port = 0;
+                        ctx->server_rtcp_port = 0;
+                    }
+
+                    const int allocated_port = allocateServerRtpPort();
+                    if (allocated_port <= 0) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 453 Not Enough Bandwidth\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    ctx->server_rtp_port = allocated_port;
+                    ctx->server_rtcp_port = allocated_port + 1;
+                    if (ctx->session_id.empty()) {
+                        ctx->session_id = generateSessionId();
+                    }
+                    ctx->state = SessionState::READY;
+
+                    snprintf(response, sizeof(response),
+                             "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
+                             "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=%d-%d\r\n"
+                             "Session: %s\r\n\r\n",
+                             ctx->cseq,
+                             ctx->client_port, ctx->client_port + 1,
+                             ctx->server_rtp_port, ctx->server_rtcp_port,
+                             ctx->session_id.c_str());
+                    send(curr_fd, response, strlen(response), 0);
+                    std::cout << "[INFO] SETUP session=" << ctx->session_id << std::endl;
+                } else if (strcmp(method, "PLAY") == 0) {
+                    if (!pathMatches(request_path, m_streamPath)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 404 Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+                    if (!sessionMatches(ctx->session_id, req)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    if (!(ctx->state == SessionState::READY || ctx->state == SessionState::PAUSED)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    if (ctx->client_port <= 0 || ctx->server_rtp_port <= 0) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    if (!ctx->rtp_sender) {
+                        ctx->rtp_sender = std::make_shared<RtpSender>(
+                            ctx->ip, ctx->client_port, ctx->server_rtp_port, ctx->is_playing.get());
+                        ctx->rtp_sender->onTraffic = [this](int bytes) {
+                            m_totalTrafficBytes.fetch_add(static_cast<uint64_t>(bytes), std::memory_order_relaxed);
+                        };
+                    }
+
+                    *(ctx->is_playing) = true;
+                    ctx->need_headers = true;
+                    ctx->state = SessionState::PLAYING;
+
+                    snprintf(response, sizeof(response),
+                             "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
+                             "Session: %s\r\nRange: npt=0.000-\r\n\r\n",
+                             ctx->cseq, ctx->session_id.c_str());
+                    send(curr_fd, response, strlen(response), 0);
+                    std::cout << "[INFO] PLAY session=" << ctx->session_id
+                              << " dst=" << ctx->ip << ":" << ctx->client_port << std::endl;
+                } else if (strcmp(method, "PAUSE") == 0) {
+                    if (!pathMatches(request_path, m_streamPath)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 404 Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+                    if (!sessionMatches(ctx->session_id, req)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    if (ctx->state != SessionState::PLAYING) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    *(ctx->is_playing) = false;
+                    ctx->state = SessionState::PAUSED;
+                    snprintf(response, sizeof(response),
+                             "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n",
+                             ctx->cseq, ctx->session_id.c_str());
+                    send(curr_fd, response, strlen(response), 0);
+                    std::cout << "[INFO] PAUSE session=" << ctx->session_id << std::endl;
+                } else if (strcmp(method, "TEARDOWN") == 0) {
+                    if (!pathMatches(request_path, m_streamPath)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 404 Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+                    if (!sessionMatches(ctx->session_id, req)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 454 Session Not Found\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    if (!(ctx->state == SessionState::READY || ctx->state == SessionState::PLAYING || ctx->state == SessionState::PAUSED)) {
+                        snprintf(response, sizeof(response),
+                                 "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                        send(curr_fd, response, strlen(response), 0);
+                        return false;
+                    }
+
+                    *(ctx->is_playing) = false;
+                    ctx->rtp_sender.reset();
+                    releaseServerRtpPort(ctx->server_rtp_port);
+                    ctx->server_rtp_port = 0;
+                    ctx->server_rtcp_port = 0;
+                    ctx->state = SessionState::CLOSED;
+
+                    snprintf(response, sizeof(response),
+                             "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n",
+                             ctx->cseq, ctx->session_id.c_str());
+                    send(curr_fd, response, strlen(response), 0);
+
+                    {
+                        std::lock_guard<std::mutex> lock(m_clientsMutex);
+                        m_clients.erase(curr_fd);
+                    }
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr_fd, nullptr);
+                    close(curr_fd);
+                    std::cout << "[INFO] TEARDOWN session=" << ctx->session_id << std::endl;
+                    return true;
+                } else {
+                    snprintf(response, sizeof(response),
+                             "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %d\r\n\r\n", ctx->cseq);
+                    send(curr_fd, response, strlen(response), 0);
+                }
+
+                return false;
+            };
+
+            while (true) {
+                const size_t header_end = ctx->recv_buffer.find("\r\n\r\n");
+                if (header_end == std::string::npos) {
+                    break;
+                }
+
+                const size_t header_len = header_end + 4;
+                size_t content_len = 0;
+                parseContentLength(ctx->recv_buffer.substr(0, header_len), content_len);
+
+                if (ctx->recv_buffer.size() < header_len + content_len) {
+                    break;
+                }
+
+                std::string request = ctx->recv_buffer.substr(0, header_len + content_len);
+                ctx->recv_buffer.erase(0, header_len + content_len);
+
+                if (handleRequest(request)) {
+                    break;
+                }
             }
         }
     }
@@ -591,6 +769,18 @@ bool TcpServer::start(int port) {
     close(epoll_fd);
     std::cout << "[INFO] Server shutdown complete" << std::endl;
     return true;
+}
+
+std::vector<TcpServer::ClientInfo> TcpServer::clientInfos() const {
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    std::vector<ClientInfo> infos;
+    infos.reserve(m_clients.size());
+    for (const auto& pair : m_clients) {
+        const auto& ctx = pair.second;
+        if (!ctx) continue;
+        infos.push_back(ClientInfo{ctx->ip, ctx->url, ctx->connected_at, ctx->state});
+    }
+    return infos;
 }
 
 void TcpServer::stopAllStreams() {
